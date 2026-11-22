@@ -66,6 +66,10 @@ DEFAULTS = {
     "beep_seconds": 3,      # مدت صدای هشدار (ثانیه)
     "exclude_radius": 300,  # آیکونی که این‌قدر (پیکسل) به تصویر مستثنی نزدیک باشد نادیده گرفته می‌شود
     "brightness_on_hit": True,  # با دیدن آیکون حراج‌جمعه روشنایی صفحه تا آخر روی ۱۰۰٪ برود
+    "sleep_at": "",         # ساعت رفتن کامپیوتر به خواب (مثلاً 02:30)؛ خالی = غیرفعال
+    "sleep_hours": 0,       # یا چند ساعت دیگر (۰ = غیرفعال)
+    "interval_after_hours": 0,  # بعد از این‌قدر ساعت رصد، فاصله رفرش عوض شود (۰ = غیرفعال)
+    "interval_after": 5.0,      # فاصله رفرش جدید (ثانیه)
 }
 
 TEMPLATES = {
@@ -74,6 +78,7 @@ TEMPLATES = {
     "cart": "cart_icon.png",
     "anchor": "anchor_filters.png",
 }
+EXCL_HINT = "(برای دیدن تصویر، یک مورد را از فهرست انتخاب کنید)"
 CAPTURE_LABELS = {
     "badge": "آیکون حراج‌جمعه",
     "add": "دکمه افزودن به سبد خرید",
@@ -458,6 +463,23 @@ def max_brightness():
     threading.Thread(target=_run, daemon=True).start()
 
 
+def sleep_computer():
+    """کامپیوتر را به حالت Sleep می‌برد (نه Hibernate)."""
+    if not IS_WIN:
+        return
+
+    def _run():
+        try:
+            ctypes.windll.powrprof.SetSuspendState(ctypes.c_ubyte(0), ctypes.c_ubyte(0), ctypes.c_ubyte(0))
+        except Exception:
+            try:
+                subprocess.run(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"],
+                               creationflags=0x08000000, timeout=30)
+            except Exception:
+                pass
+    threading.Thread(target=_run, daemon=True).start()
+
+
 # ------------------------------------------------------------------ ربات
 class Bot(threading.Thread):
     def __init__(self, app, cfg):
@@ -648,13 +670,21 @@ class Bot(threading.Thread):
             last_stat = 0.0
             sc = 0.0
             last_skip = skip_until = 0.0
+            switched = False
             while not self.stopped():
                 now = time.perf_counter()
                 if cfg.get("max_minutes", 0) > 0 and now - t_start > cfg["max_minutes"] * 60:
                     self.say(f"زمان تعیین‌شده ({cfg['max_minutes']} دقیقه) تمام شد؛ رصد متوقف شد", "warn")
                     announce("fail", "Time limit reached.", cfg)
                     break
-                if now - last_refresh >= cfg["interval"]:
+                interval = cfg["interval"]
+                ah = float(cfg.get("interval_after_hours", 0) or 0)
+                if ah > 0 and now - t_start >= ah * 3600:
+                    interval = float(cfg.get("interval_after", interval))
+                    if not switched:
+                        switched = True
+                        self.say(f"بعد از {ah:g} ساعت، فاصله رفرش از {cfg['interval']:g} به {interval:g} ثانیه تغییر کرد", "ok")
+                if now - last_refresh >= interval:
                     if foreground_is_me():
                         if now - warned > 5:
                             self.say("پنجره مرورگر فعال نیست؛ رفرش انجام نشد", "warn")
@@ -861,10 +891,13 @@ class App:
         self.q = queue.Queue()
         self.bot = None
         self._f8 = False
+        self.sleep_deadline = None
+        self._sleep_job = None
+        self._sleep_warned = False
         r = self.root = tk.Tk()
         r.title(APP_TITLE)
-        r.geometry("470x1050")
-        r.minsize(430, 950)
+        r.geometry("480x700")
+        r.minsize(440, 620)
         self.overlay = Overlay(r)
         self.f = ("Tahoma", 10)
         self.build()
@@ -889,7 +922,29 @@ class App:
         tk.Button(row, text="تشخیص مقیاس", font=f, command=self.do_calibrate,
                   pady=6).pack(side="left", expand=True, fill="x")
 
-        prow = tk.Frame(r)
+        # پایین پنجره (اول pack می‌شود تا همیشه دیده شود)
+        self.log = tk.Text(r, height=5, font=("Tahoma", 9), state="disabled", wrap="word")
+        self.log.pack(side="bottom", fill="x", padx=12, pady=(4, 12))
+        self.log.tag_configure("hit", foreground="#c0151a")
+        self.log.tag_configure("ok", foreground="#17803d")
+        self.log.tag_configure("warn", foreground="#b36b00")
+        self.log.tag_configure("error", foreground="#c0151a")
+        tk.Button(r, text="خاموش کردن هاله قرمز", font=f, command=self.overlay.hide).pack(
+            side="bottom", fill="x", padx=12, pady=4)
+        self.stats = tk.Label(r, text="رفرش: ۰   زمان: ۰   شباهت: -", font=f, anchor="e")
+        self.stats.pack(side="bottom", fill="x", padx=12)
+
+        nb = ttk.Notebook(r)
+        nb.pack(fill="both", expand=True, **pad)
+        t_set, t_img, t_exc, t_sleep, t_ref = (tk.Frame(nb) for _ in range(5))
+        nb.add(t_set, text="  تنظیمات  ")
+        nb.add(t_img, text="  تصاویر  ")
+        nb.add(t_exc, text="  مستثنی  ")
+        nb.add(t_sleep, text="  خواب  ")
+        nb.add(t_ref, text="  رفرش  ")
+
+        # ---------------- تب تنظیمات
+        prow = tk.Frame(t_set)
         prow.pack(fill="x", **pad)
         tk.Label(prow, text="پروفایل:", font=f).pack(side="right")
         self.prof_var = tk.StringVar()
@@ -900,7 +955,7 @@ class App:
         tk.Button(prow, text="بارگذاری", font=f, command=self.load_profile).pack(side="left", padx=(0, 4))
         self.refresh_profiles()
 
-        box = tk.LabelFrame(r, text=" تنظیمات ", font=f, labelanchor="ne")
+        box = tk.LabelFrame(t_set, text=" تنظیمات ", font=f, labelanchor="ne")
         box.pack(fill="x", **pad)
         self.v_interval = tk.DoubleVar(value=self.cfg["interval"])
         self.v_thr = tk.DoubleVar(value=self.cfg["threshold"])
@@ -914,6 +969,10 @@ class App:
         self.v_start = tk.StringVar(value=self.cfg["start_at"])
         self.v_shot = tk.BooleanVar(value=self.cfg["shot_on_hit"])
         self.v_top = tk.BooleanVar(value=self.cfg["always_on_top"])
+        self.v_sleep_at = tk.StringVar(value=self.cfg.get("sleep_at", ""))
+        self.v_sleep_hours = tk.StringVar(value=self.cfg.get("sleep_hours", 0))
+        self.v_int_after_h = tk.StringVar(value=self.cfg.get("interval_after_hours", 0))
+        self.v_int_after = tk.DoubleVar(value=self.cfg.get("interval_after", 5.0))
         rows = [
             ("فاصله رفرش (ثانیه)", tk.Spinbox(box, from_=1.0, to=15.0, increment=0.5, width=7,
                                              textvariable=self.v_interval, font=f)),
@@ -949,7 +1008,8 @@ class App:
                        command=lambda: self.root.attributes("-topmost", bool(self.v_top.get()))).grid(
             row=9, column=1, sticky="e", padx=8, pady=(0, 4))
 
-        adv = tk.LabelFrame(r, text=" تصویر هدف خودتان (اختیاری) ", font=f, labelanchor="ne")
+        # ---------------- تب تصاویر و مراحل
+        adv = tk.LabelFrame(t_img, text=" تصویر هدف خودتان (اختیاری) ", font=f, labelanchor="ne")
         adv.pack(fill="x", **pad)
         for key, label in CAPTURE_LABELS.items():
             tk.Button(adv, text="ثبت: " + label, font=f,
@@ -957,7 +1017,7 @@ class App:
         tk.Button(adv, text="حذف تصاویر ثبت‌شده و برگشت به تصاویر پیش‌فرض", font=f,
                   command=self.clear_custom).pack(fill="x", padx=8, pady=(2, 6))
 
-        stp = tk.LabelFrame(r, text=" مراحل اضافه (بعد از آیکون سبد، به ترتیب) ", font=f, labelanchor="ne")
+        stp = tk.LabelFrame(t_img, text=" مراحل اضافه (بعد از آیکون سبد، به ترتیب) ", font=f, labelanchor="ne")
         stp.pack(fill="x", **pad)
         self.steps_list = tk.Listbox(stp, height=4, font=f, activestyle="none", exportselection=False)
         self.steps_list.pack(fill="x", padx=8, pady=(4, 2))
@@ -972,30 +1032,74 @@ class App:
         tk.Button(brow, text="▼", font=f, width=3, command=lambda: self.move_step(1)).pack(side="left")
         self.refresh_steps()
 
-        exf = tk.LabelFrame(r, text=" تصاویر مستثنی (آیکونِ کنار این‌ها نادیده گرفته شود) ", font=f, labelanchor="ne")
-        exf.pack(fill="x", **pad)
-        self.excl_list = tk.Listbox(exf, height=3, font=f, activestyle="none", exportselection=False)
+        # ---------------- تب مستثنی
+        exf = tk.LabelFrame(t_exc, text=" تصاویر مستثنی (آیکونِ کنار این‌ها نادیده گرفته شود) ", font=f,
+                            labelanchor="ne")
+        exf.pack(fill="both", expand=True, **pad)
+        tk.Label(exf, text="تصویری را (مثلاً برچسب «ناموجود») ثبت کنید؛ هر آیکون حراج‌جمعه که نزدیک آن باشد "
+                           "نادیده گرفته می‌شود. برای تعویض، آن را از فهرست انتخاب کنید و «تعویض تصویر» را بزنید.",
+                 font=f, justify="right", wraplength=400, anchor="e").pack(fill="x", padx=8, pady=(6, 2))
+        self.excl_list = tk.Listbox(exf, height=5, font=f, activestyle="none", exportselection=False)
         self.excl_list.pack(fill="x", padx=8, pady=(4, 2))
+        self.excl_list.bind("<<ListboxSelect>>", lambda e: self.show_excl_preview())
+        pv = tk.Frame(exf, height=170, relief="groove", bd=1)
+        pv.pack(fill="x", padx=8, pady=4)
+        pv.pack_propagate(False)
+        self.excl_prev = tk.Label(pv, text=EXCL_HINT, font=f)
+        self.excl_prev.pack(expand=True)
         erow = tk.Frame(exf)
-        erow.pack(fill="x", padx=8, pady=(0, 6))
-        tk.Button(erow, text="+ مستثنی", font=f, command=self.add_excl).pack(
+        erow.pack(fill="x", padx=8, pady=(0, 8))
+        tk.Button(erow, text="+ ثبت از روی صفحه", font=f, command=self.add_excl).pack(
             side="right", expand=True, fill="x", padx=(4, 0))
         tk.Button(erow, text="از فایل", font=f, command=self.add_excl_file).pack(side="right", padx=(4, 0))
         tk.Button(erow, text="تعویض تصویر", font=f, command=self.replace_excl).pack(side="right", padx=(4, 0))
         tk.Button(erow, text="حذف", font=f, command=self.delete_excl).pack(side="right", padx=(4, 0))
         self.refresh_excl()
 
-        self.stats = tk.Label(r, text="رفرش: ۰   زمان: ۰   شباهت: -", font=f, anchor="e")
-        self.stats.pack(fill="x", padx=12)
-        tk.Button(r, text="خاموش کردن هاله قرمز", font=f, command=self.overlay.hide).pack(
-            fill="x", padx=12, pady=4)
+        # ---------------- تب خواب
+        sl = tk.LabelFrame(t_sleep, text=" خواب کامپیوتر ", font=f, labelanchor="ne")
+        sl.pack(fill="x", **pad)
+        tk.Label(sl, text="در ساعت تعیین‌شده یا چند ساعت دیگر، ربات و همه‌ی کارها متوقف می‌شوند و کامپیوتر "
+                          "به حالت Sleep می‌رود. اگر هر دو پر باشند، هرکدام زودتر برسد. "
+                          "۳۰ ثانیه قبل از خواب یک بوق هشدار می‌زند.",
+                 font=f, justify="right", wraplength=400, anchor="e").pack(fill="x", padx=8, pady=6)
+        g = tk.Frame(sl)
+        g.pack(fill="x", padx=8)
+        tk.Label(g, text="رفتن به خواب در ساعت (مثلاً 02:30)", font=f, anchor="e").grid(
+            row=0, column=1, sticky="e", padx=8, pady=3)
+        tk.Entry(g, width=9, textvariable=self.v_sleep_at, font=f, justify="center").grid(
+            row=0, column=0, sticky="w", padx=8)
+        tk.Label(g, text="یا چند ساعت دیگر (مثلاً 1٫5)", font=f, anchor="e").grid(
+            row=1, column=1, sticky="e", padx=8, pady=3)
+        tk.Spinbox(g, from_=0, to=48, increment=0.5, width=7, textvariable=self.v_sleep_hours,
+                   font=f).grid(row=1, column=0, sticky="w", padx=8)
+        g.columnconfigure(1, weight=1)
+        self.sleep_btn = tk.Button(sl, text="فعال‌سازی زمان‌بندی خواب", font=("Tahoma", 11, "bold"),
+                                   command=self.toggle_sleep, pady=6)
+        self.sleep_btn.pack(fill="x", padx=8, pady=(8, 4))
+        self._sleep_btn_style = (self.sleep_btn.cget("bg"), self.sleep_btn.cget("fg"))
+        self.sleep_info = tk.Label(sl, text="زمان‌بندی خواب غیرفعال است", font=f, anchor="e")
+        self.sleep_info.pack(fill="x", padx=8, pady=(0, 4))
+        tk.Button(sl, text="همین حالا: توقف همه‌چیز و رفتن به خواب", font=f,
+                  command=self.sleep_now).pack(fill="x", padx=8, pady=(0, 8))
 
-        self.log = tk.Text(r, height=9, font=("Tahoma", 9), state="disabled", wrap="word")
-        self.log.pack(fill="both", expand=True, padx=12, pady=(4, 12))
-        self.log.tag_configure("hit", foreground="#c0151a")
-        self.log.tag_configure("ok", foreground="#17803d")
-        self.log.tag_configure("warn", foreground="#b36b00")
-        self.log.tag_configure("error", foreground="#c0151a")
+        # ---------------- تب رفرش
+        rf = tk.LabelFrame(t_ref, text=" تغییر فاصله رفرش بعد از چند ساعت ", font=f, labelanchor="ne")
+        rf.pack(fill="x", **pad)
+        tk.Label(rf, text="مثلاً ۲ ساعت بعد از شروع رصد، فاصله رفرش از مقدار تب «تنظیمات» به مقدار جدید تغییر کند "
+                          "(رفرش‌ها کمتر یا بیشتر شوند). زمان از لحظه‌ی شروع رصد حساب می‌شود. ۰ = غیرفعال.",
+                 font=f, justify="right", wraplength=400, anchor="e").pack(fill="x", padx=8, pady=6)
+        g2 = tk.Frame(rf)
+        g2.pack(fill="x", padx=8, pady=(0, 8))
+        tk.Label(g2, text="بعد از چند ساعت (مثلاً 2 یا 1٫5)", font=f, anchor="e").grid(
+            row=0, column=1, sticky="e", padx=8, pady=3)
+        tk.Spinbox(g2, from_=0, to=48, increment=0.5, width=7, textvariable=self.v_int_after_h,
+                   font=f).grid(row=0, column=0, sticky="w", padx=8)
+        tk.Label(g2, text="فاصله رفرش جدید (ثانیه)", font=f, anchor="e").grid(
+            row=1, column=1, sticky="e", padx=8, pady=3)
+        tk.Spinbox(g2, from_=1.0, to=60.0, increment=0.5, width=7, textvariable=self.v_int_after,
+                   font=f).grid(row=1, column=0, sticky="w", padx=8)
+        g2.columnconfigure(1, weight=1)
 
     # --- ارتباط با ربات
     def post(self, fn, *a):
@@ -1058,6 +1162,7 @@ class App:
             self.cfg["max_minutes"] = max(0, int(self.v_maxmin.get()))
             self.cfg["exclude_radius"] = max(0, int(self.v_exr.get()))
             self.cfg["beep_seconds"] = min(30, max(1, int(self.v_beepsec.get())))
+            self.cfg["interval_after"] = max(1.0, float(self.v_int_after.get()))
         except (tk.TclError, ValueError):
             messagebox.showerror(APP_TITLE, "یکی از تنظیمات عدد معتبر نیست.")
             return False
@@ -1071,6 +1176,27 @@ class App:
             messagebox.showerror(APP_TITLE, "ساعت شروع باید به شکل 20:00 باشد (یا خالی بماند).")
             return False
         self.cfg["start_at"] = st
+        sa = self.v_sleep_at.get().strip()
+        if sa and not parse_hhmm(sa):
+            messagebox.showerror(APP_TITLE, "ساعت خواب باید به شکل 02:30 باشد (یا خالی بماند).")
+            return False
+        try:
+            sh = float(str(self.v_sleep_hours.get()).strip().replace("٫", ".").replace(",", ".") or 0)
+            if sh < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(APP_TITLE, "تعداد ساعتِ خواب عدد معتبر نیست.")
+            return False
+        self.cfg["sleep_at"] = sa
+        self.cfg["sleep_hours"] = sh
+        try:
+            ih = float(str(self.v_int_after_h.get()).strip().replace("٫", ".").replace(",", ".") or 0)
+            if ih < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror(APP_TITLE, "تعداد ساعتِ تغییر رفرش عدد معتبر نیست.")
+            return False
+        self.cfg["interval_after_hours"] = ih
         save_config(self.cfg)
         return True
 
@@ -1132,9 +1258,15 @@ class App:
         self.root.update()
         time.sleep(0.5)
         with mss.mss() as s:
-            shot = s.grab(s.monitors[1])
+            try:
+                mi = int(self.v_monitor.get())
+            except (tk.TclError, ValueError):
+                mi = self.cfg.get("monitor", 1)
+            mon = s.monitors[mon_index(s, mi)]
+            shot = s.grab(mon)
             img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
         top = tk.Toplevel(self.root)
+        top.geometry(f"+{mon['left']}+{mon['top']}")  # روی همان صفحه‌نمایشی که ربات رصد می‌کند
         top.attributes("-fullscreen", True)
         top.attributes("-topmost", True)
         cv = tk.Canvas(top, cursor="crosshair", highlightthickness=0)
@@ -1210,7 +1342,9 @@ class App:
         pairs = [(self.v_interval, "interval"), (self.v_thr, "threshold"), (self.v_beep, "beep"),
                  (self.v_halo, "halo"), (self.v_speak, "speak"), (self.v_monitor, "monitor"), (self.v_maxmin, "max_minutes"),
                  (self.v_exr, "exclude_radius"), (self.v_beepsec, "beep_seconds"), (self.v_start, "start_at"),
-                 (self.v_shot, "shot_on_hit"), (self.v_top, "always_on_top")]
+                 (self.v_shot, "shot_on_hit"), (self.v_top, "always_on_top"),
+                 (self.v_sleep_at, "sleep_at"), (self.v_sleep_hours, "sleep_hours"),
+                 (self.v_int_after_h, "interval_after_hours"), (self.v_int_after, "interval_after")]
         for var, key in pairs:
             try:
                 var.set(c[key])
@@ -1348,7 +1482,7 @@ class App:
         if self._import_image_file(fname):
             self.cfg["exclude_images"].append({"name": name.strip(), "file": fname})
             save_config(self.cfg)
-            self.refresh_excl()
+            self.refresh_excl(len(self.cfg["exclude_images"]) - 1)
 
     def replace_excl(self):
         sel = self.excl_list.curselection()
@@ -1356,13 +1490,40 @@ class App:
             messagebox.showinfo(APP_TITLE, "اول یک تصویر مستثنی را از فهرست انتخاب کنید.")
             return
         x = self.cfg["exclude_images"][sel[0]]
-        self._replace_image(x["name"], x["file"],
-                            lambda: self.on_log(f"تصویر مستثنی «{x['name']}» تعویض شد", "ok"))
+        self._replace_image(x["name"], x["file"], lambda: self._excl_replaced(x["name"]))
 
-    def refresh_excl(self):
+    def _excl_replaced(self, name):
+        self.on_log(f"تصویر مستثنی «{name}» تعویض شد", "ok")
+        self.show_excl_preview()
+
+    def refresh_excl(self, select=None):
         self.excl_list.delete(0, "end")
         for i, x in enumerate(self.cfg["exclude_images"], 1):
             self.excl_list.insert("end", f"{i}.  {x['name']}")
+        if select is not None and 0 <= select < self.excl_list.size():
+            self.excl_list.selection_set(select)
+            self.excl_list.see(select)
+        self.show_excl_preview()
+
+    def show_excl_preview(self):
+        self.excl_prev.configure(image="", text=EXCL_HINT)
+        self.excl_prev.image = None
+        sel = self.excl_list.curselection()
+        if not sel:
+            return
+        try:
+            from PIL import Image, ImageTk
+            x = self.cfg["exclude_images"][sel[0]]
+            img = imread(base_dir() / "templates_user" / x["file"])
+            if img is None:
+                raise ValueError("no image")
+            im = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            im.thumbnail((400, 160))
+            ph = ImageTk.PhotoImage(im)
+            self.excl_prev.configure(image=ph, text="")
+            self.excl_prev.image = ph
+        except Exception:
+            self.excl_prev.configure(image="", text="تصویر پیدا نشد؛ دوباره ثبت یا تعویض کنید")
 
     def add_excl(self):
         name = simpledialog.askstring(APP_TITLE, "یک نام برای این تصویر مستثنی بنویسید (مثلاً «برچسب ناموجود»):",
@@ -1375,7 +1536,7 @@ class App:
         def saved():
             self.cfg["exclude_images"].append({"name": name, "file": fname})
             save_config(self.cfg)
-            self.refresh_excl()
+            self.refresh_excl(len(self.cfg["exclude_images"]) - 1)
 
         self.capture(None, label=name, filename=fname, on_saved=saved)
 
@@ -1449,7 +1610,86 @@ class App:
                 n += 1
         self.on_log(f"{n} تصویر ثبت‌شده حذف شد", "ok")
 
+    # --- خواب کامپیوتر
+    def toggle_sleep(self):
+        if self.sleep_deadline:
+            self.cancel_sleep("زمان‌بندی خواب لغو شد")
+            return
+        if not self.read_settings():
+            return
+        now = time.time()
+        cands = []
+        hm = parse_hhmm(self.cfg["sleep_at"]) if self.cfg["sleep_at"] else None
+        if hm:
+            lt = time.localtime(now)
+            t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hm[0], hm[1], 0, 0, 0, -1))
+            if t <= now:
+                t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1, hm[0], hm[1], 0, 0, 0, -1))
+            cands.append(t)
+        if self.cfg["sleep_hours"] > 0:
+            cands.append(now + self.cfg["sleep_hours"] * 3600)
+        if not cands:
+            messagebox.showinfo(APP_TITLE, "یک ساعت (مثلاً 02:30) یا تعداد ساعت وارد کنید.")
+            return
+        self.sleep_deadline = min(cands)
+        self._sleep_warned = False
+        self.sleep_btn.configure(text="لغو زمان‌بندی خواب", bg="#c0151a", fg="white")
+        self.on_log("زمان‌بندی خواب فعال شد: " + time.strftime("%H:%M:%S", time.localtime(self.sleep_deadline)), "ok")
+        self.tick_sleep()
+
+    def tick_sleep(self):
+        self._sleep_job = None
+        if not self.sleep_deadline:
+            return
+        left = self.sleep_deadline - time.time()
+        if left <= 0:
+            self.sleep_now(confirm=False)
+            return
+        h, rem = divmod(int(left), 3600)
+        m, sec = divmod(rem, 60)
+        at = time.strftime("%H:%M", time.localtime(self.sleep_deadline))
+        self.sleep_info.configure(text=f"خواب ساعت {at}  —  {h} ساعت و {m} دقیقه و {sec} ثانیه مانده")
+        if left <= 30:
+            if not self._sleep_warned:
+                self._sleep_warned = True
+                user32.MessageBeep(0x30)
+                self.on_log("۳۰ ثانیه تا خواب؛ برای لغو، در تب «خواب» دکمه‌ی لغو را بزنید", "warn")
+            self.on_status(f"رفتن به خواب تا {int(left)} ثانیه دیگر", "wait")
+        self._sleep_job = self.root.after(1000, self.tick_sleep)
+
+    def cancel_sleep(self, msg=None):
+        self.sleep_deadline = None
+        self._sleep_warned = False
+        if self._sleep_job:
+            self.root.after_cancel(self._sleep_job)
+            self._sleep_job = None
+        self.sleep_btn.configure(text="فعال‌سازی زمان‌بندی خواب", bg=self._sleep_btn_style[0],
+                                 fg=self._sleep_btn_style[1])
+        self.sleep_info.configure(text="زمان‌بندی خواب غیرفعال است")
+        if msg:
+            self.on_log(msg, "ok")
+            if not self.bot:
+                self.on_status("آماده", "idle")
+
+    def sleep_now(self, confirm=True):
+        if confirm and not messagebox.askyesno(
+                APP_TITLE, "همه‌ی کارها متوقف شود و کامپیوتر به حالت Sleep برود؟", parent=self.root):
+            return
+        self.cancel_sleep()
+        if self.bot:
+            self.bot.stop_ev.set()
+        _beep_gen[0] += 1  # بوق‌های در حال پخش قطع شوند
+        self.overlay.hide()
+        stop_speech()
+        self.on_status("همه‌ی کارها متوقف شد؛ در حال رفتن به خواب", "idle")
+        self.on_log("همه‌ی کارها متوقف شد؛ کامپیوتر به حالت Sleep می‌رود", "warn")
+        self.root.after(1500, sleep_computer)
+
     def close(self):
+        if self.sleep_deadline and not messagebox.askyesno(
+                APP_TITLE, "زمان‌بندی خواب فعال است و با بستن برنامه لغو می‌شود. برنامه بسته شود؟",
+                parent=self.root):
+            return
         if self.bot:
             self.bot.stop_ev.set()
         self.overlay.hide()
