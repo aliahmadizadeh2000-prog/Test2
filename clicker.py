@@ -15,6 +15,7 @@ import os
 import json
 import math
 import shutil
+import subprocess
 import base64
 import time
 import queue
@@ -61,6 +62,8 @@ DEFAULTS = {
     "start_at": "",         # شروع خودکار در ساعت HH:MM (خالی = همین حالا)
     "shot_on_hit": True,    # ذخیره عکس صفحه لحظه دیدن آیکون در پوشه debug
     "always_on_top": False, # پنجره ربات همیشه روی بقیه
+    "speak": True,          # اعلام صوتی یک‌جمله‌ای به انگلیسی
+    "beep_seconds": 3,      # مدت صدای هشدار (ثانیه)
     "exclude_radius": 300,  # آیکونی که این‌قدر (پیکسل) به تصویر مستثنی نزدیک باشد نادیده گرفته می‌شود
 }
 
@@ -324,22 +327,87 @@ else:
         return False
 
 
-def beep(kind):
+_beep_gen = [0]
+_speaker = [None]
+BEEP_SEQS = {
+    "hit": [(880, 250), (0, 80), (880, 250), (0, 80), (1175, 500), (0, 300)],
+    "done": [(784, 400), (0, 80), (988, 400), (0, 80), (1175, 700), (0, 300)],
+    "fail": [(330, 500), (0, 80), (220, 700), (0, 300)],
+}
+SPEAK_SCRIPT = (
+    "Add-Type -AssemblyName System.Speech;"
+    "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+    "try { $s.SelectVoiceByHints('NotSet','NotSet',0,[System.Globalization.CultureInfo]'en-US') } catch {};"
+    "$s.Volume = 100;"
+    "while ($true) { $l = [Console]::In.ReadLine(); if ($l -eq $null) { break }; [void]$s.Speak($l) }"
+)
+
+
+def prewarm_speech():
+    """یک PowerShell پنهان را از قبل راه می‌اندازد تا جمله‌ها بدون تأخیر خوانده شوند."""
+    if not IS_WIN:
+        return
+    p = _speaker[0]
+    if p is not None and p.poll() is None:
+        return
+    try:
+        _speaker[0] = subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", SPEAK_SCRIPT],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=0x08000000)  # CREATE_NO_WINDOW
+    except Exception:
+        _speaker[0] = None
+
+
+def stop_speech():
+    p = _speaker[0]
+    _speaker[0] = None
+    if p is not None:
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
+def _speak(text):
+    prewarm_speech()
+    p = _speaker[0]
+    if p is None or p.stdin is None:
+        return
+    try:
+        p.stdin.write((text + "\n").encode("ascii", "ignore"))
+        p.stdin.flush()
+    except Exception:
+        _speaker[0] = None
+
+
+def announce(kind, text, cfg):
+    """اعلام موفقیت/مشکل: یک جمله‌ی انگلیسی (اگر روشن باشد) و بعد بوق (اگر روشن باشد)."""
     if not IS_WIN:
         return
     import winsound
-    seqs = {
-        "hit": [(880, 120), (0, 60), (880, 120), (0, 60), (1175, 220)],
-        "done": [(660, 600)],
-        "fail": [(300, 350), (220, 450)],
-    }
+    speak_on = bool(cfg.get("speak", True)) and bool(text)
+    _beep_gen[0] += 1
+    gen = _beep_gen[0]
 
     def _run():
-        for f, d in seqs[kind]:
-            if f:
-                winsound.Beep(f, d)
-            else:
-                time.sleep(d / 1000)
+        if speak_on:
+            _speak(text)
+        if not cfg.get("beep", True):
+            return
+        if speak_on:  # صبر کن تا جمله تمام شود تا صدای بوق روی آن نیفتد
+            end_wait = time.time() + min(4.0, 0.4 + 0.07 * len(text))
+            while time.time() < end_wait and _beep_gen[0] == gen:
+                time.sleep(0.05)
+        end = time.time() + max(0.3, float(cfg.get("beep_seconds", 3)))
+        while time.time() < end and _beep_gen[0] == gen:
+            for f, d in BEEP_SEQS[kind]:
+                if time.time() >= end or _beep_gen[0] != gen:
+                    return
+                if f:
+                    winsound.Beep(f, d)
+                else:
+                    time.sleep(d / 1000)
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -537,8 +605,7 @@ class Bot(threading.Thread):
                 now = time.perf_counter()
                 if cfg.get("max_minutes", 0) > 0 and now - t_start > cfg["max_minutes"] * 60:
                     self.say(f"زمان تعیین‌شده ({cfg['max_minutes']} دقیقه) تمام شد؛ رصد متوقف شد", "warn")
-                    if cfg["beep"]:
-                        beep("fail")
+                    announce("fail", "Time limit reached.", cfg)
                     break
                 if now - last_refresh >= cfg["interval"]:
                     if foreground_is_me():
@@ -580,8 +647,7 @@ class Bot(threading.Thread):
     def sequence(self, loc, badge, sc):
         cfg, s = self.cfg, self.s
         self.app.post(self.app.on_hit)
-        if cfg["beep"]:
-            beep("hit")
+        announce("hit", "Sale found.", cfg)
         t0 = time.perf_counter()
         frame = self.grab() if cfg.get("shot_on_hit", True) else None
         cx, cy = self.center(loc, badge)
@@ -648,8 +714,7 @@ class Bot(threading.Thread):
                 return
         total = time.perf_counter() - t0
         self.say(f"{'همه مراحل انجام شد' if cfg.get('extra_steps') else 'به صفحه سبد رسید'} ({total:.2f} ثانیه از دیدن آیکون). بقیه مراحل با شماست", "hit")
-        if cfg["beep"]:
-            beep("done")
+        announce("done", "All steps completed successfully.", cfg)
         self.app.post(self.app.on_finish, "done")
 
     def save_hit_shot(self, frame, loc, badge, cx, cy):
@@ -667,8 +732,7 @@ class Bot(threading.Thread):
 
     def fail(self, msg):
         self.say(msg + ". کنترل با شماست", "error")
-        if self.cfg["beep"]:
-            beep("fail")
+        announce("fail", "A step failed. Please check the screen.", self.cfg)
         self.app.post(self.app.on_finish, "fail")
 
 
@@ -781,9 +845,11 @@ class App:
         self.v_thr = tk.DoubleVar(value=self.cfg["threshold"])
         self.v_beep = tk.BooleanVar(value=self.cfg["beep"])
         self.v_halo = tk.BooleanVar(value=self.cfg["halo"])
+        self.v_speak = tk.BooleanVar(value=self.cfg["speak"])
         self.v_monitor = tk.IntVar(value=self.cfg["monitor"])
         self.v_maxmin = tk.IntVar(value=self.cfg["max_minutes"])
         self.v_exr = tk.IntVar(value=self.cfg["exclude_radius"])
+        self.v_beepsec = tk.IntVar(value=self.cfg["beep_seconds"])
         self.v_start = tk.StringVar(value=self.cfg["start_at"])
         self.v_shot = tk.BooleanVar(value=self.cfg["shot_on_hit"])
         self.v_top = tk.BooleanVar(value=self.cfg["always_on_top"])
@@ -805,10 +871,17 @@ class App:
             tk.Label(box, text=txt, font=f, anchor="e").grid(row=i, column=1, sticky="e", padx=8, pady=3)
             w.grid(row=i, column=0, sticky="w", padx=8)
         box.columnconfigure(1, weight=1)
-        tk.Checkbutton(box, text="هاله قرمز", variable=self.v_halo, font=f).grid(
-            row=6, column=1, sticky="e", padx=8)
-        tk.Checkbutton(box, text="صدای هشدار", variable=self.v_beep, font=f).grid(
-            row=7, column=1, sticky="e", padx=8)
+        hf = tk.Frame(box)
+        hf.grid(row=6, column=1, sticky="e", padx=8)
+        tk.Checkbutton(hf, text="هاله قرمز", variable=self.v_halo, font=f).pack(side="right")
+        tk.Checkbutton(hf, text="اعلام صوتی (انگلیسی)", variable=self.v_speak, font=f).pack(side="right", padx=(0, 10))
+        bf = tk.Frame(box)
+        bf.grid(row=7, column=1, sticky="e", padx=8)
+        tk.Checkbutton(bf, text="صدای هشدار", variable=self.v_beep, font=f).pack(side="right")
+        tk.Label(bf, text="ثانیه", font=f).pack(side="left")
+        tk.Spinbox(bf, from_=1, to=30, increment=1, width=4, textvariable=self.v_beepsec,
+                   font=f).pack(side="left", padx=4)
+        tk.Label(bf, text="مدت:", font=f).pack(side="left")
         tk.Checkbutton(box, text="ذخیره عکس صفحه لحظه دیدن آیکون", variable=self.v_shot, font=f).grid(
             row=8, column=1, sticky="e", padx=8)
         tk.Checkbutton(box, text="پنجره ربات همیشه روی بقیه", variable=self.v_top, font=f,
@@ -908,7 +981,7 @@ class App:
         else:
             self.on_status("متوقف شد", "idle")
             self.overlay.hide()
-        if kind in ("done", "fail", "error"):
+        if kind == "error":  # برای موفقیت یا مشکل مرحله‌ها فقط بوق می‌زند؛ پنجره جلو نمی‌آید
             self.root.deiconify()
 
     # --- کنترل
@@ -919,11 +992,13 @@ class App:
             self.cfg["monitor"] = max(1, int(self.v_monitor.get()))
             self.cfg["max_minutes"] = max(0, int(self.v_maxmin.get()))
             self.cfg["exclude_radius"] = max(0, int(self.v_exr.get()))
+            self.cfg["beep_seconds"] = min(30, max(1, int(self.v_beepsec.get())))
         except (tk.TclError, ValueError):
             messagebox.showerror(APP_TITLE, "یکی از تنظیمات عدد معتبر نیست.")
             return False
         self.cfg["beep"] = bool(self.v_beep.get())
         self.cfg["halo"] = bool(self.v_halo.get())
+        self.cfg["speak"] = bool(self.v_speak.get())
         self.cfg["shot_on_hit"] = bool(self.v_shot.get())
         self.cfg["always_on_top"] = bool(self.v_top.get())
         st = self.v_start.get().strip()
@@ -941,6 +1016,8 @@ class App:
         if not self.read_settings():
             return
         self.overlay.hide()
+        if self.cfg.get("speak", True):
+            prewarm_speech()
         self.bot = Bot(self, self.cfg)
         self.btn.configure(text="توقف  (F8)", bg="#c0151a")
         self.log.configure(state="normal")
@@ -1066,8 +1143,8 @@ class App:
     def apply_cfg_to_ui(self):
         c = self.cfg
         pairs = [(self.v_interval, "interval"), (self.v_thr, "threshold"), (self.v_beep, "beep"),
-                 (self.v_halo, "halo"), (self.v_monitor, "monitor"), (self.v_maxmin, "max_minutes"),
-                 (self.v_exr, "exclude_radius"), (self.v_start, "start_at"),
+                 (self.v_halo, "halo"), (self.v_speak, "speak"), (self.v_monitor, "monitor"), (self.v_maxmin, "max_minutes"),
+                 (self.v_exr, "exclude_radius"), (self.v_beepsec, "beep_seconds"), (self.v_start, "start_at"),
                  (self.v_shot, "shot_on_hit"), (self.v_top, "always_on_top")]
         for var, key in pairs:
             try:
@@ -1184,75 +1261,4 @@ class App:
             pass
         save_config(self.cfg)
         self.refresh_excl()
-        self.on_log(f"تصویر مستثنی «{x['name']}» حذف شد", "ok")
-
-    def refresh_steps(self, select=None):
-        self.steps_list.delete(0, "end")
-        for i, st in enumerate(self.cfg["extra_steps"], 1):
-            self.steps_list.insert("end", f"{i}.  {st['name']}")
-        if select is not None and 0 <= select < len(self.cfg["extra_steps"]):
-            self.steps_list.selection_set(select)
-
-    def add_step(self):
-        name = simpledialog.askstring(APP_TITLE, "یک نام برای این مرحله بنویسید (مثلاً «ادامه خرید»):",
-                                      parent=self.root)
-        if not name or not name.strip():
-            return
-        name = name.strip()
-        fname = f"step_{int(time.time())}.png"
-
-        def saved():
-            self.cfg["extra_steps"].append({"name": name, "file": fname})
-            save_config(self.cfg)
-            self.refresh_steps(len(self.cfg["extra_steps"]) - 1)
-
-        self.capture(None, label=name, filename=fname, on_saved=saved)
-
-    def delete_step(self):
-        sel = self.steps_list.curselection()
-        if not sel:
-            return
-        st = self.cfg["extra_steps"].pop(sel[0])
-        try:
-            (base_dir() / "templates_user" / st["file"]).unlink()
-        except OSError:
-            pass
-        save_config(self.cfg)
-        self.refresh_steps()
-        self.on_log(f"مرحله «{st['name']}» حذف شد", "ok")
-
-    def move_step(self, d):
-        sel = self.steps_list.curselection()
-        if not sel:
-            return
-        i, j = sel[0], sel[0] + d
-        steps = self.cfg["extra_steps"]
-        if 0 <= j < len(steps):
-            steps[i], steps[j] = steps[j], steps[i]
-            save_config(self.cfg)
-            self.refresh_steps(j)
-
-    def clear_custom(self):
-        d = base_dir() / "templates_user"
-        n = 0
-        if d.exists():
-            for p in d.glob("*.png"):
-                if p.name.startswith(("step_", "excl_")):
-                    continue
-                p.unlink()
-                n += 1
-        self.on_log(f"{n} تصویر ثبت‌شده حذف شد", "ok")
-
-    def close(self):
-        if self.bot:
-            self.bot.stop_ev.set()
-        self.overlay.hide()
-        self.root.destroy()
-
-    def run(self):
-        self.on_log("آماده. صفحه لیست محصولات را در مرورگر باز کنید و شروع را بزنید.")
-        self.root.mainloop()
-
-
-if __name__ == "__main__":
-    App().run()
+        self.on_log(f"تصویر مستثنی «{x['name'
