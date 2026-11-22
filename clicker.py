@@ -4,7 +4,7 @@
 
 صفحه را مرتب رفرش می‌کند، با پردازش تصویر دنبال آیکون «حراج‌جمعه!» می‌گردد و
 به محض دیدنش این مسیر را می‌رود:
-    کلیک روی محصول ← افزودن به سبد خرید ← آیکون سبد ← توقف
+    کلیک روی محصول ← افزودن به سبد خرید ← آیکون سبد ← مراحل اضافه‌ی خودتان ← توقف
 در طول مسیر یک هاله قرمز دور صفحه می‌آید و صدای هشدار پخش می‌شود.
 
 توقف اضطراری: کلید F8، یا بردن ماوس به گوشه بالا-چپ صفحه.
@@ -25,7 +25,7 @@ import cv2
 
 try:
     import tkinter as tk
-    from tkinter import messagebox
+    from tkinter import messagebox, simpledialog
 except ImportError:  # فقط برای تست منطق تشخیص روی سیستم‌های بدون tkinter
     tk = None
 
@@ -50,12 +50,15 @@ DEFAULTS = {
     "threshold": 0.80,      # حداقل شباهت برای آیکون حراج‌جمعه
     "btn_threshold": 0.80,  # حداقل شباهت برای دکمه‌ها
     "confirm": 2,           # تعداد فریم پشت‌سرهم برای تأیید دیدن آیکون
-    "click_dx": 0,          # جابه‌جایی کلیک نسبت به مرکز آیکون (پیکسل، در مقیاس عکس مرجع)
-    "click_dy": 60,         # مثبت یعنی پایین‌تر، داخل کارت محصول
     "step_timeout": 8.0,    # حداکثر انتظار برای باز شدن هر صفحه (ثانیه)
     "scale": 0.0,           # 0 یعنی خودکار
     "beep": True,
     "halo": True,
+    "monitor": 1,           # شماره صفحه‌نمایش (۱ = اصلی)
+    "max_minutes": 0,       # توقف خودکار بعد از این‌قدر دقیقه (۰ = بدون محدودیت)
+    "start_at": "",         # شروع خودکار در ساعت HH:MM (خالی = همین حالا)
+    "shot_on_hit": True,    # ذخیره عکس صفحه لحظه دیدن آیکون در پوشه debug
+    "always_on_top": False, # پنجره ربات همیشه روی بقیه
 }
 
 TEMPLATES = {
@@ -127,6 +130,25 @@ def imwrite(path, img):
         buf.tofile(str(path))
 
 
+def parse_hhmm(text):
+    """«20:00» ← (20, 0)؛ اگر معتبر نبود None."""
+    try:
+        h, m = str(text).strip().split(":")
+        h, m = int(h), int(m)
+        return (h, m) if 0 <= h < 24 and 0 <= m < 60 else None
+    except Exception:
+        return None
+
+
+def mon_index(sct, idx):
+    """شماره صفحه‌نمایش معتبر برمی‌گرداند؛ در غیر این صورت صفحه اصلی."""
+    try:
+        idx = int(idx)
+    except (TypeError, ValueError):
+        return 1
+    return idx if 1 <= idx < len(sct.monitors) else 1
+
+
 # ------------------------------------------------------------------ پردازش تصویر
 class Templates:
     """قالب‌ها را می‌خواند. تصویر ثبت‌شده‌ی خود کاربر (templates_user) اولویت دارد و مقیاس نمی‌خورد."""
@@ -171,6 +193,49 @@ def best_match(frame, tpl):
     res = np.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
     _, mx, _, loc = cv2.minMaxLoc(res)
     return float(mx), loc
+
+
+MULTS = [1.0, 0.92, 1.08, 0.85, 1.17, 0.78, 1.28, 0.7, 1.4, 0.6, 1.6]  # ضریب اندازه‌هایی که امتحان می‌شود
+
+
+class Finder:
+    """یک تصویر هدف را در چند اندازه جست‌وجو می‌کند.
+    اندازه‌ی آخرین موفقیت اول امتحان می‌شود؛ در هر بار فراخوانی یک اندازه‌ی دیگر هم نوبتی بررسی می‌شود،
+    پس سرعت حلقه زیاد کم نمی‌شود و بعد از چند بار همه‌ی اندازه‌ها پوشش داده شده‌اند."""
+
+    def __init__(self, raw, base):
+        self.raw, self.base, self.hint = raw, float(base), float(base)
+        self.cache = {}
+        self.i = 0
+
+    def tpl(self, s):
+        k = round(s, 3)
+        if k not in self.cache:
+            if abs(s - 1.0) < 0.01:
+                self.cache[k] = self.raw
+            else:
+                interp = cv2.INTER_CUBIC if s > 1 else cv2.INTER_AREA
+                self.cache[k] = cv2.resize(self.raw, None, fx=s, fy=s, interpolation=interp)
+        return self.cache[k]
+
+    def match(self, frame, thr):
+        """(امتیاز، موقعیت، تصویر هم‌اندازه‌ی پیداشده) را برمی‌گرداند."""
+        t = self.tpl(self.hint)
+        sc, loc = best_match(frame, t)
+        best = (sc, loc, t)
+        if sc >= thr:
+            return best
+        cs = self.base * MULTS[self.i % len(MULTS)]
+        self.i += 1
+        if abs(cs - self.hint) > 0.005:
+            t2 = self.tpl(cs)
+            if min(t2.shape[:2]) >= 8:
+                sc2, loc2 = best_match(frame, t2)
+                if sc2 > sc:
+                    best = (sc2, loc2, t2)
+                if sc2 >= thr:
+                    self.hint = cs
+        return best
 
 
 def calibrate(frame, templates):
@@ -266,6 +331,7 @@ class Bot(threading.Thread):
         self.stop_ev = threading.Event()
         self.T = Templates()
         self.last_best = 0.0
+        self.finders = {}
 
     # --- کمکی‌ها
     def say(self, msg, level="info"):
@@ -296,10 +362,15 @@ class Bot(threading.Thread):
         h, w = tpl.shape[:2]
         return (self.mon["left"] + loc[0] + w / 2, self.mon["top"] + loc[1] + h / 2)
 
+    def finder(self, key):
+        if key not in self.finders:
+            raw, custom = self.T.load_raw(key)
+            self.finders[key] = Finder(raw, 1.0 if custom else self.s)
+        return self.finders[key]
+
     def find_now(self, key):
-        tpl = self.T.scaled(key, self.s)
-        sc, loc = best_match(self.grab(), tpl)
         thr = self.cfg["btn_threshold"]
+        sc, loc, tpl = self.finder(key).match(self.grab(), thr)
         return (self.center(loc, tpl), sc) if sc >= thr else (None, sc)
 
     def wait_for(self, key, timeout):
@@ -310,6 +381,20 @@ class Bot(threading.Thread):
             best = max(best, sc)
             if pt:
                 return pt, sc
+            time.sleep(0.02)
+        self.last_best = best
+        return None, best
+
+    def wait_for_tpl(self, fd, timeout):
+        """مثل wait_for ولی برای تصویر دلخواه کاربر (در چند اندازه)."""
+        end = time.perf_counter() + timeout
+        best = 0.0
+        thr = self.cfg["btn_threshold"]
+        while time.perf_counter() < end and not self.stopped():
+            sc, loc, tpl = fd.match(self.grab(), thr)
+            best = max(best, sc)
+            if sc >= thr:
+                return self.center(loc, tpl), sc
             time.sleep(0.02)
         self.last_best = best
         return None, best
@@ -333,7 +418,28 @@ class Bot(threading.Thread):
         cfg = self.cfg
         with mss.mss() as sct:
             self.sct = sct
-            self.mon = sct.monitors[1]
+            mi = mon_index(sct, cfg.get("monitor", 1))
+            self.mon = sct.monitors[mi]
+            if mi > 1:
+                self.say(f"رصد روی صفحه‌نمایش شماره {mi}")
+            t_sched = parse_hhmm(cfg.get("start_at", ""))
+            if t_sched:
+                lt = time.localtime()
+                target = time.mktime(lt[:3] + (t_sched[0], t_sched[1], 0, 0, 0, -1))
+                remain = target - time.time()
+                if remain <= 0:
+                    self.say("ساعت شروع امروز گذشته؛ همین حالا شروع می‌شود", "warn")
+                else:
+                    self.say(f"شروع خودکار ساعت {t_sched[0]:02d}:{t_sched[1]:02d}. مرورگر را آماده و فعال نگه دارید")
+                    while remain > 0:
+                        if self.stopped():
+                            self.app.post(self.app.on_finish, "stop")
+                            return
+                        h, rem = divmod(int(remain), 3600)
+                        m, sec = divmod(rem, 60)
+                        self.app.post(self.app.on_status, f"شروع تا {h:02d}:{m:02d}:{sec:02d} دیگر", "wait")
+                        time.sleep(min(0.5, max(0.0, remain)))
+                        remain = target - time.time()
             self.app.post(self.app.on_status, "۳ ثانیه فرصت دارید پنجره مرورگر را فعال کنید", "wait")
             if self.sleep(3):
                 self.app.post(self.app.on_finish, "stop")
@@ -353,7 +459,7 @@ class Bot(threading.Thread):
                 self.say(f"مقیاس ثابت: {s:.2f}")
             self.s = s
 
-            badge = self.T.scaled("badge", s)
+            fb = self.finder("badge")
             self.app.post(self.app.on_status, "در حال رصد صفحه", "run")
             last_refresh = -1e9
             warned = -1e9
@@ -364,6 +470,11 @@ class Bot(threading.Thread):
             sc = 0.0
             while not self.stopped():
                 now = time.perf_counter()
+                if cfg.get("max_minutes", 0) > 0 and now - t_start > cfg["max_minutes"] * 60:
+                    self.say(f"زمان تعیین‌شده ({cfg['max_minutes']} دقیقه) تمام شد؛ رصد متوقف شد", "warn")
+                    if cfg["beep"]:
+                        beep("fail")
+                    break
                 if now - last_refresh >= cfg["interval"]:
                     if foreground_is_me():
                         if now - warned > 5:
@@ -373,7 +484,7 @@ class Bot(threading.Thread):
                         press_key(0x74)  # F5
                         refreshes += 1
                     last_refresh = now
-                sc, loc = best_match(self.grab(), badge)
+                sc, loc, badge = fb.match(self.grab(), cfg["threshold"])
                 hits = hits + 1 if sc >= cfg["threshold"] else 0
                 if now - last_stat > 0.25:
                     self.app.post(self.app.on_stats, refreshes, now - t_start, sc)
@@ -382,6 +493,7 @@ class Bot(threading.Thread):
                     self.sequence(loc, badge, sc)
                     return
                 time.sleep(0.005)
+            self.say(f"پایان رصد: {refreshes} رفرش در {int(time.perf_counter() - t_start)} ثانیه")
             self.app.post(self.app.on_finish, "stop")
 
     # --- مسیر کلیک‌ها
@@ -391,11 +503,12 @@ class Bot(threading.Thread):
         if cfg["beep"]:
             beep("hit")
         t0 = time.perf_counter()
+        frame = self.grab() if cfg.get("shot_on_hit", True) else None
         cx, cy = self.center(loc, badge)
-        cx += cfg["click_dx"] * s
-        cy += cfg["click_dy"] * s
         self.say(f"آیکون حراج‌جمعه دیده شد (شباهت {sc:.2f}). کلیک روی محصول", "hit")
         click(cx, cy)
+        if frame is not None:
+            self.save_hit_shot(frame, loc, badge, cx, cy)
 
         pt, sc2 = self.wait_for("add", cfg["step_timeout"])
         if not pt:
@@ -433,11 +546,44 @@ class Bot(threading.Thread):
         if self.sleep(0.8):
             self.app.post(self.app.on_finish, "stop")
             return
+        for i, st in enumerate(cfg.get("extra_steps", []), 1):
+            name = st.get("name", f"مرحله {i}")
+            path = base_dir() / "templates_user" / st["file"]
+            tpl = imread(path) if path.exists() else None
+            if tpl is None:
+                self.say(f"تصویر مرحله «{name}» پیدا نشد؛ این مرحله رد شد", "warn")
+                continue
+            self.say(f"مرحله اضافه {i}: منتظر «{name}»")
+            pt3, _ = self.wait_for_tpl(Finder(tpl, 1.0), cfg["step_timeout"])
+            if not pt3:
+                if self.stop_ev.is_set():
+                    self.app.post(self.app.on_finish, "stop")
+                    return
+                self.save_debug(f"no_step_{i}.png")
+                return self.fail(f"مرحله «{name}» پیدا نشد (بهترین شباهت {self.last_best:.2f})")
+            click(*pt3)
+            self.say(f"کلیک روی «{name}»", "ok")
+            if self.sleep(0.5):
+                self.app.post(self.app.on_finish, "stop")
+                return
         total = time.perf_counter() - t0
-        self.say(f"به صفحه سبد رسید ({total:.2f} ثانیه از دیدن آیکون). بقیه مراحل با شماست", "hit")
+        self.say(f"{'همه مراحل انجام شد' if cfg.get('extra_steps') else 'به صفحه سبد رسید'} ({total:.2f} ثانیه از دیدن آیکون). بقیه مراحل با شماست", "hit")
         if cfg["beep"]:
             beep("done")
         self.app.post(self.app.on_finish, "done")
+
+    def save_hit_shot(self, frame, loc, badge, cx, cy):
+        """عکس صفحه با کادر دور آیکون و نقطه کلیک را در پوشه debug ذخیره می‌کند."""
+        try:
+            h, w = badge.shape[:2]
+            x, y = int(loc[0]), int(loc[1])
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 3)
+            cv2.circle(frame, (int(cx - self.mon["left"]), int(cy - self.mon["top"])), 14, (0, 200, 0), 3)
+            path = base_dir() / "debug" / time.strftime("hit_%Y%m%d_%H%M%S.png")
+            threading.Thread(target=imwrite, args=(path, frame), daemon=True).start()
+            self.say(f"عکس صفحه ذخیره شد: debug/{path.name}")
+        except Exception:
+            pass
 
     def fail(self, msg):
         self.say(msg + ". کنترل با شماست", "error")
@@ -501,16 +647,20 @@ class App:
         if tk is None or not IS_WIN:
             raise SystemExit("این برنامه فقط روی ویندوز اجرا می‌شود.")
         self.cfg = load_config()
+        self.cfg["extra_steps"] = [
+            {"name": str(x.get("name") or x["file"]), "file": str(x["file"])}
+            for x in self.cfg.get("extra_steps", []) if isinstance(x, dict) and x.get("file")]
         self.q = queue.Queue()
         self.bot = None
         self._f8 = False
         r = self.root = tk.Tk()
         r.title(APP_TITLE)
-        r.geometry("470x700")
-        r.minsize(430, 640)
+        r.geometry("470x900")
+        r.minsize(430, 830)
         self.overlay = Overlay(r)
         self.f = ("Tahoma", 10)
         self.build()
+        r.attributes("-topmost", bool(self.cfg["always_on_top"]))
         r.after(30, self.pump)
         r.after(40, self.poll_hotkey)
         r.protocol("WM_DELETE_WINDOW", self.close)
@@ -535,25 +685,38 @@ class App:
         box.pack(fill="x", **pad)
         self.v_interval = tk.DoubleVar(value=self.cfg["interval"])
         self.v_thr = tk.DoubleVar(value=self.cfg["threshold"])
-        self.v_dy = tk.IntVar(value=self.cfg["click_dy"])
         self.v_beep = tk.BooleanVar(value=self.cfg["beep"])
         self.v_halo = tk.BooleanVar(value=self.cfg["halo"])
+        self.v_monitor = tk.IntVar(value=self.cfg["monitor"])
+        self.v_maxmin = tk.IntVar(value=self.cfg["max_minutes"])
+        self.v_start = tk.StringVar(value=self.cfg["start_at"])
+        self.v_shot = tk.BooleanVar(value=self.cfg["shot_on_hit"])
+        self.v_top = tk.BooleanVar(value=self.cfg["always_on_top"])
         rows = [
             ("فاصله رفرش (ثانیه)", tk.Spinbox(box, from_=1.0, to=15.0, increment=0.5, width=7,
                                              textvariable=self.v_interval, font=f)),
             ("حداقل شباهت آیکون (۰٫۶ تا ۰٫۹۵)", tk.Spinbox(box, from_=0.6, to=0.95, increment=0.01,
                                                            width=7, textvariable=self.v_thr, font=f)),
-            ("کلیک این‌قدر پایین‌تر از آیکون (پیکسل)", tk.Spinbox(box, from_=-200, to=400, increment=10,
-                                                                  width=7, textvariable=self.v_dy, font=f)),
+            ("شماره صفحه‌نمایش (۱ = اصلی)", tk.Spinbox(box, from_=1, to=6, increment=1, width=7,
+                                                     textvariable=self.v_monitor, font=f)),
+            ("توقف خودکار بعد از (دقیقه، ۰ = نامحدود)", tk.Spinbox(box, from_=0, to=600, increment=5,
+                                                                  width=7, textvariable=self.v_maxmin, font=f)),
+            ("شروع خودکار در ساعت (مثلاً 20:00)", tk.Entry(box, width=9, textvariable=self.v_start,
+                                                          font=f, justify="center")),
         ]
         for i, (txt, w) in enumerate(rows):
             tk.Label(box, text=txt, font=f, anchor="e").grid(row=i, column=1, sticky="e", padx=8, pady=3)
             w.grid(row=i, column=0, sticky="w", padx=8)
         box.columnconfigure(1, weight=1)
         tk.Checkbutton(box, text="هاله قرمز", variable=self.v_halo, font=f).grid(
-            row=3, column=1, sticky="e", padx=8)
+            row=6, column=1, sticky="e", padx=8)
         tk.Checkbutton(box, text="صدای هشدار", variable=self.v_beep, font=f).grid(
-            row=4, column=1, sticky="e", padx=8, pady=(0, 4))
+            row=7, column=1, sticky="e", padx=8)
+        tk.Checkbutton(box, text="ذخیره عکس صفحه لحظه دیدن آیکون", variable=self.v_shot, font=f).grid(
+            row=8, column=1, sticky="e", padx=8)
+        tk.Checkbutton(box, text="پنجره ربات همیشه روی بقیه", variable=self.v_top, font=f,
+                       command=lambda: self.root.attributes("-topmost", bool(self.v_top.get()))).grid(
+            row=9, column=1, sticky="e", padx=8, pady=(0, 4))
 
         adv = tk.LabelFrame(r, text=" تصویر هدف خودتان (اختیاری) ", font=f, labelanchor="ne")
         adv.pack(fill="x", **pad)
@@ -562,6 +725,19 @@ class App:
                       command=lambda k=key: self.capture(k)).pack(fill="x", padx=8, pady=2)
         tk.Button(adv, text="حذف تصاویر ثبت‌شده و برگشت به تصاویر پیش‌فرض", font=f,
                   command=self.clear_custom).pack(fill="x", padx=8, pady=(2, 6))
+
+        stp = tk.LabelFrame(r, text=" مراحل اضافه (بعد از آیکون سبد، به ترتیب) ", font=f, labelanchor="ne")
+        stp.pack(fill="x", **pad)
+        self.steps_list = tk.Listbox(stp, height=4, font=f, activestyle="none", exportselection=False)
+        self.steps_list.pack(fill="x", padx=8, pady=(4, 2))
+        brow = tk.Frame(stp)
+        brow.pack(fill="x", padx=8, pady=(0, 6))
+        tk.Button(brow, text="+ افزودن مرحله", font=f, command=self.add_step).pack(
+            side="right", expand=True, fill="x", padx=(4, 0))
+        tk.Button(brow, text="حذف", font=f, command=self.delete_step).pack(side="right", padx=(4, 0))
+        tk.Button(brow, text="▲", font=f, width=3, command=lambda: self.move_step(-1)).pack(side="left")
+        tk.Button(brow, text="▼", font=f, width=3, command=lambda: self.move_step(1)).pack(side="left")
+        self.refresh_steps()
 
         self.stats = tk.Label(r, text="رفرش: ۰   زمان: ۰   شباهت: -", font=f, anchor="e")
         self.stats.pack(fill="x", padx=12)
@@ -632,12 +808,20 @@ class App:
         try:
             self.cfg["interval"] = max(1.0, float(self.v_interval.get()))
             self.cfg["threshold"] = min(0.95, max(0.5, float(self.v_thr.get())))
-            self.cfg["click_dy"] = int(self.v_dy.get())
+            self.cfg["monitor"] = max(1, int(self.v_monitor.get()))
+            self.cfg["max_minutes"] = max(0, int(self.v_maxmin.get()))
         except (tk.TclError, ValueError):
             messagebox.showerror(APP_TITLE, "یکی از تنظیمات عدد معتبر نیست.")
             return False
         self.cfg["beep"] = bool(self.v_beep.get())
         self.cfg["halo"] = bool(self.v_halo.get())
+        self.cfg["shot_on_hit"] = bool(self.v_shot.get())
+        self.cfg["always_on_top"] = bool(self.v_top.get())
+        st = self.v_start.get().strip()
+        if st and not parse_hhmm(st):
+            messagebox.showerror(APP_TITLE, "ساعت شروع باید به شکل 20:00 باشد (یا خالی بماند).")
+            return False
+        self.cfg["start_at"] = st
         save_config(self.cfg)
         return True
 
@@ -669,7 +853,7 @@ class App:
         self.root.update()
         time.sleep(1.2)
         with mss.mss() as s:
-            frame = np.ascontiguousarray(np.asarray(s.grab(s.monitors[1]))[:, :, :3])
+            frame = np.ascontiguousarray(np.asarray(s.grab(s.monitors[mon_index(s, self.v_monitor.get())]))[:, :, :3])
         sc, sv, loc, shp = calibrate(frame, Templates())
         self.root.deiconify()
         if sc >= 0.55:
@@ -687,10 +871,12 @@ class App:
                 "پنل «فیلترها» در صفحه پیدا نشد.\nصفحه لیست محصولات را تمام‌صفحه باز بگذارید "
                 "و دوباره امتحان کنید. تا آن موقع مقیاس خودکار حدس زده می‌شود.")
 
-    def capture(self, key):
+    def capture(self, key, label=None, filename=None, on_saved=None):
         """یک ناحیه از صفحه را با ماوس انتخاب می‌کند و به‌عنوان تصویر هدف ذخیره می‌کند."""
         import mss
         from PIL import Image, ImageTk
+        label = label or CAPTURE_LABELS[key]
+        filename = filename or TEMPLATES[key]
         self.root.withdraw()
         self.root.update()
         time.sleep(0.5)
@@ -709,7 +895,7 @@ class App:
         cv.photo = photo
         cv.create_rectangle(cw / 2 - 300, 10, cw / 2 + 300, 50, fill="black")
         cv.create_text(cw / 2, 30, fill="white", font=("Tahoma", 13),
-                       text=f"دور «{CAPTURE_LABELS[key]}» یک کادر بکشید. (Esc = لغو)")
+                       text=f"دور «{label}» یک کادر بکشید. (Esc = لغو)")
         st = {}
 
         def down(e):
@@ -733,8 +919,10 @@ class App:
                 self.on_log("ناحیه خیلی کوچک بود؛ ذخیره نشد", "warn")
                 return
             arr = cv2.cvtColor(np.asarray(img.crop(box)), cv2.COLOR_RGB2BGR)
-            imwrite(base_dir() / "templates_user" / TEMPLATES[key], arr)
-            self.on_log(f"تصویر «{CAPTURE_LABELS[key]}» ذخیره شد ({arr.shape[1]}×{arr.shape[0]})", "ok")
+            imwrite(base_dir() / "templates_user" / filename, arr)
+            self.on_log(f"تصویر «{label}» ذخیره شد ({arr.shape[1]}×{arr.shape[0]})", "ok")
+            if on_saved:
+                on_saved()
 
         def cancel(_e=None):
             top.destroy()
@@ -746,11 +934,59 @@ class App:
         top.bind("<Escape>", cancel)
         top.focus_force()
 
+    def refresh_steps(self, select=None):
+        self.steps_list.delete(0, "end")
+        for i, st in enumerate(self.cfg["extra_steps"], 1):
+            self.steps_list.insert("end", f"{i}.  {st['name']}")
+        if select is not None and 0 <= select < len(self.cfg["extra_steps"]):
+            self.steps_list.selection_set(select)
+
+    def add_step(self):
+        name = simpledialog.askstring(APP_TITLE, "یک نام برای این مرحله بنویسید (مثلاً «ادامه خرید»):",
+                                      parent=self.root)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        fname = f"step_{int(time.time())}.png"
+
+        def saved():
+            self.cfg["extra_steps"].append({"name": name, "file": fname})
+            save_config(self.cfg)
+            self.refresh_steps(len(self.cfg["extra_steps"]) - 1)
+
+        self.capture(None, label=name, filename=fname, on_saved=saved)
+
+    def delete_step(self):
+        sel = self.steps_list.curselection()
+        if not sel:
+            return
+        st = self.cfg["extra_steps"].pop(sel[0])
+        try:
+            (base_dir() / "templates_user" / st["file"]).unlink()
+        except OSError:
+            pass
+        save_config(self.cfg)
+        self.refresh_steps()
+        self.on_log(f"مرحله «{st['name']}» حذف شد", "ok")
+
+    def move_step(self, d):
+        sel = self.steps_list.curselection()
+        if not sel:
+            return
+        i, j = sel[0], sel[0] + d
+        steps = self.cfg["extra_steps"]
+        if 0 <= j < len(steps):
+            steps[i], steps[j] = steps[j], steps[i]
+            save_config(self.cfg)
+            self.refresh_steps(j)
+
     def clear_custom(self):
         d = base_dir() / "templates_user"
         n = 0
         if d.exists():
             for p in d.glob("*.png"):
+                if p.name.startswith("step_"):
+                    continue
                 p.unlink()
                 n += 1
         self.on_log(f"{n} تصویر ثبت‌شده حذف شد", "ok")
