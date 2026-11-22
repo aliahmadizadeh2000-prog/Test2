@@ -65,6 +65,7 @@ DEFAULTS = {
     "speak": True,          # اعلام صوتی یک‌جمله‌ای به انگلیسی
     "beep_seconds": 3,      # مدت صدای هشدار (ثانیه)
     "exclude_radius": 300,  # آیکونی که این‌قدر (پیکسل) به تصویر مستثنی نزدیک باشد نادیده گرفته می‌شود
+    "brightness_on_hit": True,  # با دیدن آیکون حراج‌جمعه روشنایی صفحه تا آخر روی ۱۰۰٪ برود
 }
 
 TEMPLATES = {
@@ -405,6 +406,58 @@ def announce(kind, text, cfg):
     threading.Thread(target=_run, daemon=True).start()
 
 
+def max_brightness():
+    """روشنایی صفحه را روی ۱۰۰٪ می‌برد: لپ‌تاپ با WMI و مانیتور خارجی با DDC/CI (در پس‌زمینه)."""
+    if not IS_WIN:
+        return
+
+    def _run():
+        try:  # صفحه داخلی لپ‌تاپ
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command",
+                 "(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1,100)"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=0x08000000, timeout=10)
+        except Exception:
+            pass
+        try:  # مانیتور خارجی (اگر DDC/CI را پشتیبانی کند)
+            dxva2 = ctypes.windll.dxva2
+
+            class _PHYS(ctypes.Structure):
+                _fields_ = [("h", wintypes.HANDLE), ("desc", ctypes.c_wchar * 128)]
+
+            dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+            dxva2.GetPhysicalMonitorsFromHMONITOR.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(_PHYS)]
+            dxva2.GetMonitorBrightness.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
+                                                   ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD)]
+            dxva2.SetMonitorBrightness.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            dxva2.DestroyPhysicalMonitors.argtypes = [wintypes.DWORD, ctypes.POINTER(_PHYS)]
+            enum_proc = ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HANDLE, wintypes.HANDLE,
+                                           ctypes.c_void_p, wintypes.LPARAM)
+
+            def _cb(hmon, hdc, rect, lp):
+                try:
+                    n = wintypes.DWORD(0)
+                    if dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, ctypes.byref(n)) and n.value:
+                        arr = (_PHYS * n.value)()
+                        if dxva2.GetPhysicalMonitorsFromHMONITOR(hmon, n, arr):
+                            for pm in arr:
+                                lo, cur, hi = wintypes.DWORD(), wintypes.DWORD(), wintypes.DWORD()
+                                if dxva2.GetMonitorBrightness(pm.h, ctypes.byref(lo), ctypes.byref(cur), ctypes.byref(hi)):
+                                    dxva2.SetMonitorBrightness(pm.h, hi.value)
+                            dxva2.DestroyPhysicalMonitors(n, arr)
+                except Exception:
+                    pass
+                return 1
+
+            cb = enum_proc(_cb)
+            user32.EnumDisplayMonitors.argtypes = [ctypes.c_void_p, ctypes.c_void_p, enum_proc, wintypes.LPARAM]
+            user32.EnumDisplayMonitors(None, None, cb, 0)
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
+
 # ------------------------------------------------------------------ ربات
 class Bot(threading.Thread):
     def __init__(self, app, cfg):
@@ -647,6 +700,8 @@ class Bot(threading.Thread):
         cx, cy = self.center(loc, badge)
         self.say(f"آیکون حراج‌جمعه دیده شد (شباهت {sc:.2f}). کلیک روی محصول", "hit")
         click(cx, cy)
+        if cfg.get("brightness_on_hit", True):
+            max_brightness()  # روشنایی صفحه تا آخر زیاد بماند
         if frame is not None:
             self.save_hit_shot(frame, loc, badge, cx, cy)
 
