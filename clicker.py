@@ -13,6 +13,8 @@
 import sys
 import os
 import json
+import math
+import shutil
 import base64
 import time
 import queue
@@ -25,7 +27,7 @@ import cv2
 
 try:
     import tkinter as tk
-    from tkinter import messagebox, simpledialog
+    from tkinter import messagebox, simpledialog, ttk
 except ImportError:  # فقط برای تست منطق تشخیص روی سیستم‌های بدون tkinter
     tk = None
 
@@ -59,6 +61,7 @@ DEFAULTS = {
     "start_at": "",         # شروع خودکار در ساعت HH:MM (خالی = همین حالا)
     "shot_on_hit": True,    # ذخیره عکس صفحه لحظه دیدن آیکون در پوشه debug
     "always_on_top": False, # پنجره ربات همیشه روی بقیه
+    "exclude_radius": 300,  # آیکونی که این‌قدر (پیکسل) به تصویر مستثنی نزدیک باشد نادیده گرفته می‌شود
 }
 
 TEMPLATES = {
@@ -195,6 +198,24 @@ def best_match(frame, tpl):
     return float(mx), loc
 
 
+def all_matches(frame, tpl, thr, limit=12):
+    """همه‌ی جاهایی که تصویر با شباهت ≥ thr دیده می‌شود: [(امتیاز، (x, y)), ...]"""
+    th, tw = tpl.shape[:2]
+    if frame.shape[0] < th or frame.shape[1] < tw:
+        return []
+    res = cv2.matchTemplate(frame, tpl, cv2.TM_CCOEFF_NORMED)
+    res = np.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
+    out = []
+    for _ in range(limit):
+        _, mx, _, loc = cv2.minMaxLoc(res)
+        if mx < thr:
+            break
+        out.append((float(mx), loc))
+        res[max(0, loc[1] - th // 2):loc[1] + th // 2 + 1, max(0, loc[0] - tw // 2):loc[0] + tw // 2 + 1] = -1.0
+    return out
+
+
+EXCL_MULTS = [1.0, 0.92, 1.08, 0.85, 1.17, 0.78, 1.28]  # اندازه‌هایی که برای تصویر مستثنی امتحان می‌شود
 MULTS = [1.0, 0.92, 1.08, 0.85, 1.17, 0.78, 1.28, 0.7, 1.4, 0.6, 1.6]  # ضریب اندازه‌هایی که امتحان می‌شود
 
 
@@ -362,6 +383,41 @@ class Bot(threading.Thread):
         h, w = tpl.shape[:2]
         return (self.mon["left"] + loc[0] + w / 2, self.mon["top"] + loc[1] + h / 2)
 
+    def eligible_badge(self, frame, fb, badge):
+        """آیکون‌هایی را که کنار تصویر مستثنی نیستند پیدا می‌کند و بهترینشان را برمی‌گرداند (یا None)."""
+        cfg = self.cfg
+        cands = all_matches(frame, badge, cfg["threshold"])
+        if not cands:
+            return None
+        ratio = fb.hint / fb.base
+        boxes = []
+        for i, raw in enumerate(self.excl):
+            for m in EXCL_MULTS:
+                sc_e = ratio * m
+                k = (i, round(sc_e, 3))
+                if k not in self.excl_cache:
+                    self.excl_cache[k] = raw if abs(sc_e - 1.0) < 0.01 else cv2.resize(
+                        raw, None, fx=sc_e, fy=sc_e, interpolation=cv2.INTER_CUBIC if sc_e > 1 else cv2.INTER_AREA)
+                t = self.excl_cache[k]
+                if min(t.shape[:2]) < 8:
+                    continue
+                for _, l in all_matches(frame, t, cfg["btn_threshold"]):
+                    boxes.append((l[0], l[1], l[0] + t.shape[1], l[1] + t.shape[0]))
+        radius = cfg["exclude_radius"] * fb.hint
+        bh, bw = badge.shape[:2]
+        for sc, loc in sorted(cands, reverse=True):
+            cx, cy = loc[0] + bw / 2, loc[1] + bh / 2
+            blocked = False
+            for x0, y0, x1, y1 in boxes:
+                inside = x0 <= cx <= x1 and y0 <= cy <= y1
+                near = math.hypot(cx - (x0 + x1) / 2, cy - (y0 + y1) / 2) <= radius
+                if inside or near:
+                    blocked = True
+                    break
+            if not blocked:
+                return sc, loc
+        return None
+
     def finder(self, key):
         if key not in self.finders:
             raw, custom = self.T.load_raw(key)
@@ -460,6 +516,14 @@ class Bot(threading.Thread):
             self.s = s
 
             fb = self.finder("badge")
+            self.excl, self.excl_cache = [], {}
+            for x in cfg.get("exclude_images", []):
+                pth = base_dir() / "templates_user" / x["file"]
+                img = imread(pth) if pth.exists() else None
+                if img is not None:
+                    self.excl.append(img)
+            if self.excl:
+                self.say(f"{len(self.excl)} تصویر مستثنی فعال است؛ آیکونِ کنار آن‌ها نادیده گرفته می‌شود")
             self.app.post(self.app.on_status, "در حال رصد صفحه", "run")
             last_refresh = -1e9
             warned = -1e9
@@ -468,6 +532,7 @@ class Bot(threading.Thread):
             t_start = time.perf_counter()
             last_stat = 0.0
             sc = 0.0
+            last_skip = skip_until = 0.0
             while not self.stopped():
                 now = time.perf_counter()
                 if cfg.get("max_minutes", 0) > 0 and now - t_start > cfg["max_minutes"] * 60:
@@ -484,8 +549,23 @@ class Bot(threading.Thread):
                         press_key(0x74)  # F5
                         refreshes += 1
                     last_refresh = now
-                sc, loc, badge = fb.match(self.grab(), cfg["threshold"])
-                hits = hits + 1 if sc >= cfg["threshold"] else 0
+                frame = self.grab()
+                sc, loc, badge = fb.match(frame, cfg["threshold"])
+                ok = sc >= cfg["threshold"]
+                if ok and self.excl:
+                    if now < skip_until:
+                        ok = False
+                    else:
+                        pick = self.eligible_badge(frame, fb, badge)
+                        if pick:
+                            sc, loc = pick
+                        else:
+                            ok = False
+                            skip_until = now + 0.15
+                            if now - last_skip > 3:
+                                self.say("آیکون حراج‌جمعه کنار تصویر مستثنی بود؛ نادیده گرفته شد", "warn")
+                                last_skip = now
+                hits = hits + 1 if ok else 0
                 if now - last_stat > 0.25:
                     self.app.post(self.app.on_stats, refreshes, now - t_start, sc)
                     last_stat = now
@@ -647,6 +727,9 @@ class App:
         if tk is None or not IS_WIN:
             raise SystemExit("این برنامه فقط روی ویندوز اجرا می‌شود.")
         self.cfg = load_config()
+        self.cfg["exclude_images"] = [
+            {"name": str(x.get("name") or x["file"]), "file": str(x["file"])}
+            for x in self.cfg.get("exclude_images", []) if isinstance(x, dict) and x.get("file")]
         self.cfg["extra_steps"] = [
             {"name": str(x.get("name") or x["file"]), "file": str(x["file"])}
             for x in self.cfg.get("extra_steps", []) if isinstance(x, dict) and x.get("file")]
@@ -655,8 +738,8 @@ class App:
         self._f8 = False
         r = self.root = tk.Tk()
         r.title(APP_TITLE)
-        r.geometry("470x900")
-        r.minsize(430, 830)
+        r.geometry("470x1050")
+        r.minsize(430, 950)
         self.overlay = Overlay(r)
         self.f = ("Tahoma", 10)
         self.build()
@@ -681,6 +764,17 @@ class App:
         tk.Button(row, text="تشخیص مقیاس", font=f, command=self.do_calibrate,
                   pady=6).pack(side="left", expand=True, fill="x")
 
+        prow = tk.Frame(r)
+        prow.pack(fill="x", **pad)
+        tk.Label(prow, text="پروفایل:", font=f).pack(side="right")
+        self.prof_var = tk.StringVar()
+        self.prof_box = ttk.Combobox(prow, textvariable=self.prof_var, state="readonly", font=f, width=16)
+        self.prof_box.pack(side="right", padx=6)
+        tk.Button(prow, text="ذخیره", font=f, command=self.save_profile).pack(side="left")
+        tk.Button(prow, text="حذف", font=f, command=self.delete_profile).pack(side="left", padx=(0, 4))
+        tk.Button(prow, text="بارگذاری", font=f, command=self.load_profile).pack(side="left", padx=(0, 4))
+        self.refresh_profiles()
+
         box = tk.LabelFrame(r, text=" تنظیمات ", font=f, labelanchor="ne")
         box.pack(fill="x", **pad)
         self.v_interval = tk.DoubleVar(value=self.cfg["interval"])
@@ -689,6 +783,7 @@ class App:
         self.v_halo = tk.BooleanVar(value=self.cfg["halo"])
         self.v_monitor = tk.IntVar(value=self.cfg["monitor"])
         self.v_maxmin = tk.IntVar(value=self.cfg["max_minutes"])
+        self.v_exr = tk.IntVar(value=self.cfg["exclude_radius"])
         self.v_start = tk.StringVar(value=self.cfg["start_at"])
         self.v_shot = tk.BooleanVar(value=self.cfg["shot_on_hit"])
         self.v_top = tk.BooleanVar(value=self.cfg["always_on_top"])
@@ -701,6 +796,8 @@ class App:
                                                      textvariable=self.v_monitor, font=f)),
             ("توقف خودکار بعد از (دقیقه، ۰ = نامحدود)", tk.Spinbox(box, from_=0, to=600, increment=5,
                                                                   width=7, textvariable=self.v_maxmin, font=f)),
+            ("فاصله‌ی تصویر مستثنی از آیکون (پیکسل)", tk.Spinbox(box, from_=0, to=2000, increment=25, width=7,
+                                                              textvariable=self.v_exr, font=f)),
             ("شروع خودکار در ساعت (مثلاً 20:00)", tk.Entry(box, width=9, textvariable=self.v_start,
                                                           font=f, justify="center")),
         ]
@@ -738,6 +835,17 @@ class App:
         tk.Button(brow, text="▲", font=f, width=3, command=lambda: self.move_step(-1)).pack(side="left")
         tk.Button(brow, text="▼", font=f, width=3, command=lambda: self.move_step(1)).pack(side="left")
         self.refresh_steps()
+
+        exf = tk.LabelFrame(r, text=" تصاویر مستثنی (آیکونِ کنار این‌ها نادیده گرفته شود) ", font=f, labelanchor="ne")
+        exf.pack(fill="x", **pad)
+        self.excl_list = tk.Listbox(exf, height=3, font=f, activestyle="none", exportselection=False)
+        self.excl_list.pack(fill="x", padx=8, pady=(4, 2))
+        erow = tk.Frame(exf)
+        erow.pack(fill="x", padx=8, pady=(0, 6))
+        tk.Button(erow, text="+ افزودن تصویر مستثنی", font=f, command=self.add_excl).pack(
+            side="right", expand=True, fill="x", padx=(4, 0))
+        tk.Button(erow, text="حذف", font=f, command=self.delete_excl).pack(side="right", padx=(4, 0))
+        self.refresh_excl()
 
         self.stats = tk.Label(r, text="رفرش: ۰   زمان: ۰   شباهت: -", font=f, anchor="e")
         self.stats.pack(fill="x", padx=12)
@@ -810,6 +918,7 @@ class App:
             self.cfg["threshold"] = min(0.95, max(0.5, float(self.v_thr.get())))
             self.cfg["monitor"] = max(1, int(self.v_monitor.get()))
             self.cfg["max_minutes"] = max(0, int(self.v_maxmin.get()))
+            self.cfg["exclude_radius"] = max(0, int(self.v_exr.get()))
         except (tk.TclError, ValueError):
             messagebox.showerror(APP_TITLE, "یکی از تنظیمات عدد معتبر نیست.")
             return False
@@ -934,6 +1043,149 @@ class App:
         top.bind("<Escape>", cancel)
         top.focus_force()
 
+    # --- پروفایل‌ها: ذخیره و بارگذاری کل تنظیمات + مراحل + تصاویر
+    def profile_names(self):
+        d = base_dir() / "profiles"
+        if not d.exists():
+            return []
+        return sorted(x.name for x in d.iterdir() if (x / "profile.json").exists())
+
+    def refresh_profiles(self, select=None):
+        names = self.profile_names()
+        self.prof_box["values"] = names
+        if select in names:
+            self.prof_var.set(select)
+        elif self.prof_var.get() not in names:
+            self.prof_var.set("")
+
+    def _clean_lists(self):
+        for k in ("exclude_images", "extra_steps"):
+            self.cfg[k] = [{"name": str(x.get("name") or x["file"]), "file": str(x["file"])}
+                           for x in self.cfg.get(k, []) if isinstance(x, dict) and x.get("file")]
+
+    def apply_cfg_to_ui(self):
+        c = self.cfg
+        pairs = [(self.v_interval, "interval"), (self.v_thr, "threshold"), (self.v_beep, "beep"),
+                 (self.v_halo, "halo"), (self.v_monitor, "monitor"), (self.v_maxmin, "max_minutes"),
+                 (self.v_exr, "exclude_radius"), (self.v_start, "start_at"),
+                 (self.v_shot, "shot_on_hit"), (self.v_top, "always_on_top")]
+        for var, key in pairs:
+            try:
+                var.set(c[key])
+            except (tk.TclError, ValueError):
+                pass
+        self.root.attributes("-topmost", bool(c["always_on_top"]))
+        self.refresh_steps()
+        self.refresh_excl()
+
+    def save_profile(self):
+        if not self.read_settings():
+            return
+        name = simpledialog.askstring(APP_TITLE, "یک نام برای این پروفایل بنویسید:",
+                                      initialvalue=self.prof_var.get(), parent=self.root)
+        if not name:
+            return
+        bad = set('/:*?"<>|' + chr(92))
+        name = "".join(ch for ch in name if ch not in bad).strip().strip(".")
+        if not name:
+            messagebox.showerror(APP_TITLE, "این نام قابل استفاده نیست.")
+            return
+        d = base_dir() / "profiles" / name
+        if d.exists():
+            if not messagebox.askyesno(APP_TITLE, f"پروفایل «{name}» قبلاً هست. جایگزین شود؟"):
+                return
+            shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "profile.json").write_text(json.dumps(self.cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+        files = set(TEMPLATES.values())
+        files |= {x["file"] for x in self.cfg["extra_steps"]} | {x["file"] for x in self.cfg["exclude_images"]}
+        n = 0
+        for fn in files:
+            src = base_dir() / "templates_user" / fn
+            if src.exists():
+                shutil.copy2(src, d / fn)
+                n += 1
+        self.refresh_profiles(name)
+        self.on_log(f"پروفایل «{name}» ذخیره شد ({n} تصویر)", "ok")
+
+    def load_profile(self):
+        if self.bot:
+            messagebox.showinfo(APP_TITLE, "اول ربات را متوقف کنید، بعد پروفایل را بارگذاری کنید.")
+            return
+        name = self.prof_var.get().strip()
+        if not name:
+            messagebox.showinfo(APP_TITLE, "اول یک پروفایل را از فهرست انتخاب کنید.")
+            return
+        d = base_dir() / "profiles" / name
+        try:
+            data = json.loads((d / "profile.json").read_text(encoding="utf-8"))
+        except Exception:
+            messagebox.showerror(APP_TITLE, "این پروفایل پیدا نشد یا خراب است.")
+            self.refresh_profiles()
+            return
+        if not messagebox.askyesno(APP_TITLE, f"تنظیمات و مراحل فعلی با پروفایل «{name}» جایگزین می‌شود. ادامه؟"):
+            return
+        ud = base_dir() / "templates_user"
+        ud.mkdir(parents=True, exist_ok=True)
+        for fn in TEMPLATES.values():  # تصاویر اصلی ثبت‌شده‌ی فعلی؛ پروفایل خودش را می‌آورد
+            try:
+                (ud / fn).unlink()
+            except OSError:
+                pass
+        for img in d.glob("*.png"):
+            shutil.copy2(img, ud / img.name)
+        new = dict(DEFAULTS)
+        new.update(data if isinstance(data, dict) else {})
+        self.cfg.clear()
+        self.cfg.update(new)
+        self._clean_lists()
+        self.apply_cfg_to_ui()
+        save_config(self.cfg)
+        self.on_log(f"پروفایل «{name}» بارگذاری شد", "ok")
+
+    def delete_profile(self):
+        name = self.prof_var.get().strip()
+        if not name:
+            return
+        if not messagebox.askyesno(APP_TITLE, f"پروفایل «{name}» برای همیشه حذف شود؟"):
+            return
+        shutil.rmtree(base_dir() / "profiles" / name, ignore_errors=True)
+        self.refresh_profiles()
+        self.on_log(f"پروفایل «{name}» حذف شد", "ok")
+
+    def refresh_excl(self):
+        self.excl_list.delete(0, "end")
+        for i, x in enumerate(self.cfg["exclude_images"], 1):
+            self.excl_list.insert("end", f"{i}.  {x['name']}")
+
+    def add_excl(self):
+        name = simpledialog.askstring(APP_TITLE, "یک نام برای این تصویر مستثنی بنویسید (مثلاً «برچسب ناموجود»):",
+                                      parent=self.root)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        fname = f"excl_{int(time.time())}.png"
+
+        def saved():
+            self.cfg["exclude_images"].append({"name": name, "file": fname})
+            save_config(self.cfg)
+            self.refresh_excl()
+
+        self.capture(None, label=name, filename=fname, on_saved=saved)
+
+    def delete_excl(self):
+        sel = self.excl_list.curselection()
+        if not sel:
+            return
+        x = self.cfg["exclude_images"].pop(sel[0])
+        try:
+            (base_dir() / "templates_user" / x["file"]).unlink()
+        except OSError:
+            pass
+        save_config(self.cfg)
+        self.refresh_excl()
+        self.on_log(f"تصویر مستثنی «{x['name']}» حذف شد", "ok")
+
     def refresh_steps(self, select=None):
         self.steps_list.delete(0, "end")
         for i, st in enumerate(self.cfg["extra_steps"], 1):
@@ -985,7 +1237,7 @@ class App:
         n = 0
         if d.exists():
             for p in d.glob("*.png"):
-                if p.name.startswith("step_"):
+                if p.name.startswith(("step_", "excl_")):
                     continue
                 p.unlink()
                 n += 1
