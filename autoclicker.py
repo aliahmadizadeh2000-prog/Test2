@@ -1,569 +1,591 @@
 # -*- coding: utf-8 -*-
-"""Auto Clicker engine: image matching, rules, actions, Windows input (Windows only for real input)."""
+"""اتو کلیکر: رابط کاربری. هسته در engine.py است؛ خواندن عدد (اختیاری) در digits.py."""
 import sys
-import os
 import json
-import math
+import copy
 import shutil
-import subprocess
-import base64
 import time
-import random
+import queue
 import threading
 import traceback
-import itertools
 from pathlib import Path
 
 import numpy as np
 import cv2
 
-IS_WIN = sys.platform == "win32"
-if IS_WIN:
-    import ctypes
-    from ctypes import wintypes
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # real pixel coordinates
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
-    user32 = ctypes.windll.user32
+try:
+    import tkinter as tk
+    from tkinter import messagebox, simpledialog, filedialog, ttk
+except ImportError:
+    tk = None
+
+import engine as E
+from engine import *
+import profiles
 
 try:
-    from assets import EMBEDDED  # base64 images of the Black Friday profile
-except Exception:
-    EMBEDDED = {}
+    import digits
+    HAS_DIGITS = True
+except ImportError:
+    digits, HAS_DIGITS = None, False
 
-APP_TITLE = "اتو کلیکر"
-REF_WIDTH = 1280  # width of screenshots the embedded images were cut from
-CONFIG_NAME = "autoclicker.json"
-
-SETTINGS = {
-    "refresh": 0.0,            # F5 every N seconds (0 = off)
-    "refresh_after_hours": 0,  # after N hours of watching, use refresh_after
-    "refresh_after": 5.0,
-    "threshold": 0.80,         # default image similarity
-    "monitor": 1,
-    "max_minutes": 0,          # auto stop (0 = never)
-    "start_at": "",            # HH:MM scheduled start
-    "countdown": 3,            # seconds to switch to the target window
-    "tick": 0.02,              # loop period
-    "settle": 0.4,             # pause after a rule fires
-    "beep": True,
-    "beep_seconds": 3,
-    "speak": True,
-    "halo": True,
-    "always_on_top": False,
-    "test_mode": False,
-    "announce_end": True,
-    "sleep_at": "",
-    "sleep_hours": 0,
-}
-
-MULTS = [1.0, 0.92, 1.08, 0.85, 1.17, 0.78, 1.28, 0.7, 1.4, 0.6, 1.6]  # ~60%..160%
-NEAR_MULTS = [1.0, 0.92, 1.08, 0.85, 1.17, 0.78, 1.28]
-_cnt = itertools.count(1)
-_TR = str.maketrans("۰۱۲۳۴۵۶۷۸۹٫,", "0123456789..", "٬، ")
+FONT = ("Tahoma", 10)
+SMALL = ("Tahoma", 9)
+BOLD = ("Tahoma", 11, "bold")
+GRAY = "#666666"
+MORE_BY = [("min", "کمترین عدد"), ("max", "بیشترین عدد"), ("list", "ترتیب فهرست اعداد")] if HAS_DIGITS else []
 
 
-def new_id(prefix):
-    return prefix + format(int(time.time() * 1000), "x")[-7:] + str(next(_cnt))
+# ------------------------------------------------------------------ red halo and on-screen boxes
+class Overlay:
+    KEY = "#010203"
+
+    def __init__(self, root):
+        self.root, self.win, self.job, self.on = root, None, None, False
+        self.bwin = None
+
+    def _make(self, geo):
+        w = tk.Toplevel(self.root)
+        w.overrideredirect(True)
+        w.attributes("-topmost", True)
+        w.geometry(geo)
+        w.configure(bg=self.KEY)
+        w.attributes("-transparentcolor", self.KEY)
+        cv = tk.Canvas(w, bg=self.KEY, highlightthickness=0)
+        cv.pack(fill="both", expand=True)
+        w.update_idletasks()
+        if IS_WIN:  # click-through
+            hwnd = user32.GetParent(w.winfo_id()) or w.winfo_id()
+            ex = user32.GetWindowLongW(hwnd, -20)
+            user32.SetWindowLongW(hwnd, -20, ex | 0x80000 | 0x20 | 0x80)
+        return w, cv
+
+    def show(self, text, steady=False):
+        self.hide()
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        self.win, cv = self._make("%dx%d+0+0" % (sw, sh))
+        self.cv = cv
+        self.rect = cv.create_rectangle(8, 8, sw - 8, sh - 8, outline="#e5262b", width=16)
+        cv.create_rectangle(sw / 2 - 260, 16, sw / 2 + 260, 62, fill="#e5262b", outline="")
+        cv.create_text(sw / 2, 39, text=text, fill="white", font=("Tahoma", 16, "bold"))
+        if not steady:
+            self._pulse()
+
+    def _pulse(self):
+        if not self.win:
+            return
+        self.on = not self.on
+        self.cv.itemconfigure(self.rect, width=22 if self.on else 12)
+        self.job = self.root.after(350, self._pulse)
+
+    def hide(self):
+        if self.job:
+            self.root.after_cancel(self.job)
+            self.job = None
+        for n in ("win", "bwin"):
+            w = getattr(self, n)
+            if w:
+                w.destroy()
+                setattr(self, n, None)
+
+    def boxes(self, rects, mon, secs=2.5):
+        """Draws green rectangles (monitor coordinates) for a few seconds."""
+        if self.bwin:
+            self.bwin.destroy()
+        geo = "%dx%d+%d+%d" % (mon["width"], mon["height"], mon["left"], mon["top"])
+        self.bwin, cv = self._make(geo)
+        for x0, y0, x1, y1 in rects:
+            cv.create_rectangle(x0, y0, x1, y1, outline="#00c853", width=4)
+        w = self.bwin
+        self.root.after(int(secs * 1000), lambda: w.destroy() if w is self.bwin and self.bwin else None)
 
 
-def num(text, default=0.0):
-    """Float from text with Persian digits / decimal separator."""
-    try:
-        return float(str(text).translate(_TR))
-    except (TypeError, ValueError):
-        return default
+# ------------------------------------------------------------------ generic small form dialog
+class Form(tk.Toplevel):
+    """Modal form. fields: dicts with k (key), l (label), t (type), h (short hint), o (options), req.
+    Types: str, num, bool, choice [(value, label)], img / imgs (one / several library images), rule / rules, rel (rectangle relative to an
+    anchor image), pt (screen point), area (screen rectangle). After closing, .res is a dict or None."""
+
+    def __init__(self, app, title, fields, values=None, note="", check=None):
+        super().__init__(app.top())
+        self.app, self.fields, self.check, self.res = app, fields, check, None
+        self.fd = {f["k"]: f for f in fields}
+        self.vals, self.vars, self.maps, self.combos, self.multi = dict(values or {}), {}, {}, {}, {}
+        self.title(title)
+        self.transient(app.root)
+        self.resizable(False, False)
+        body = tk.Frame(self)
+        body.pack(fill="both", expand=True, padx=12, pady=8)
+        if note:
+            tk.Label(body, text=note, font=SMALL, fg=GRAY, wraplength=420, justify="right", anchor="e").pack(fill="x", pady=(0, 6))
+        for f in fields:
+            self.add_row(body, f)
+        bar = tk.Frame(self)
+        bar.pack(fill="x", padx=12, pady=(0, 10))
+        tk.Button(bar, text="تأیید", font=FONT, width=10, command=self.ok).pack(side="right")
+        tk.Button(bar, text="لغو", font=FONT, width=10, command=self.destroy).pack(side="right", padx=6)
+        self.bind("<Escape>", lambda e: self.destroy())
+        self.update_idletasks()
+        self.geometry("+%d+%d" % (app.root.winfo_rootx() + 40, app.root.winfo_rooty() + 60))
+        self.grab_set()
+        self.wait_window(self)
+
+    def options(self, f):
+        o = f.get("o")
+        if f["t"] in ("img", "imgs"):
+            return [(m["id"], m["name"]) for m in self.app.cfg["images"]]
+        if f["t"] in ("rule", "rules"):
+            return [(r["id"], r.get("name") or "بدون نام") for r in self.app.cfg["rules"] if r["id"] != f.get("exclude")]
+        return o() if callable(o) else (o or [])
+
+    def add_row(self, body, f):
+        k, t, cur = f["k"], f["t"], self.vals.get(f["k"])
+        box = tk.Frame(body)
+        box.pack(fill="x", pady=2)
+        row = tk.Frame(box)
+        row.pack(fill="x")
+        tk.Label(row, text=f["l"], font=FONT, anchor="e", justify="right", wraplength=210).pack(side="right", padx=(8, 0))
+        if t in ("str", "num"):
+            v = tk.StringVar(value="" if cur is None else str(cur))
+            tk.Entry(row, textvariable=v, font=FONT, width=26, justify="center").pack(side="left", fill="x", expand=True)
+        elif t == "bool":
+            v = tk.BooleanVar(value=bool(cur))
+            tk.Checkbutton(row, variable=v).pack(side="left")
+        elif t in ("choice", "img", "rule"):
+            opts = self.options(f)
+            self.maps[k] = {lb: val for val, lb in opts}
+            v = tk.StringVar(value=dict(opts).get(cur, ""))
+            cb = ttk.Combobox(row, textvariable=v, values=[lb for _, lb in opts], state="readonly", font=FONT, width=24)
+            cb.pack(side="left", fill="x", expand=True)
+            self.combos[k] = cb
+            if t == "img":
+                tk.Button(row, text="+ جدید", font=SMALL, command=lambda: self.new_image(k)).pack(side="left", padx=3)
+        elif t in ("imgs", "rules"):
+            opts = self.options(f)
+            self.multi[k] = [val for val, _ in opts]
+            lbx = tk.Listbox(row, selectmode="multiple", height=min(5, max(2, len(opts))), exportselection=False, font=FONT, width=26)
+            for val, name in opts:
+                lbx.insert("end", name)
+                if val in (cur or []):
+                    lbx.selection_set(lbx.size() - 1)
+            lbx.pack(side="left", fill="x", expand=True)
+            self.combos[k] = lbx
+            v = None
+            if t == "imgs":
+                tk.Button(row, text="+ جدید", font=SMALL, command=lambda: self.new_image(k)).pack(side="left", padx=3)
+        else:
+            v = None
+            lb = tk.Label(row, font=SMALL, fg=GRAY, text=self.summ(t, cur))
+            tk.Button(row, text="انتخاب نقطه" if t == "pt" else "کشیدن کادر", font=SMALL,
+                      command=lambda: self.pick(f, lb)).pack(side="left")
+            if t == "area":
+                tk.Button(row, text="پاک", font=SMALL, command=lambda: self.clear(k, lb, t)).pack(side="left", padx=3)
+            lb.pack(side="left", padx=4)
+        self.vars[k] = v
+        if f.get("h"):
+            tk.Label(box, text=f["h"], font=SMALL, fg=GRAY, wraplength=420, justify="right", anchor="e").pack(fill="x")
+
+    def summ(self, t, cur):
+        if not cur:
+            return "ثبت نشده"
+        return "(%d، %d)" % tuple(cur[:2]) if t == "pt" else "ثبت شد (%d×%d)" % (abs(cur[2] - (cur[0] if t == "area" else 0)), abs(cur[3] - (cur[1] if t == "area" else 0)))
+
+    def clear(self, k, lb, t):
+        self.vals[k] = None
+        lb.configure(text=self.summ(t, None))
+
+    def new_image(self, k):
+        meta = self.app.capture_image()
+        if meta and k in self.multi:
+            self.multi[k].append(meta["id"])
+            self.combos[k].insert("end", meta["name"])
+            self.combos[k].selection_set("end")
+        elif meta:
+            self.maps[k][meta["name"]] = meta["id"]
+            self.combos[k]["values"] = list(self.maps[k].keys())
+            self.vars[k].set(meta["name"])
+
+    def pick(self, f, lb):
+        t = f["t"]
+        if t == "rel":
+            iid = f["anchor"](self)
+            if not iid:
+                messagebox.showinfo(APP_TITLE, "اول تصویر لنگر (تصویری که باید دیده شود) را انتخاب کنید.", parent=self)
+                return
+            r = self.app.pick_rel(iid)
+        else:
+            got = self.app.grab_rects(["روی نقطه‌ی کلیک یک کادر کوچک بکشید" if t == "pt" else f["l"]])
+            r = None
+            if got:
+                x0, y0, x1, y1 = got[0][0]
+                r = [int((x0 + x1) / 2), int((y0 + y1) / 2)] if t == "pt" else [x0, y0, x1, y1]
+        if r:
+            self.vals[f["k"]] = r
+            lb.configure(text=self.summ(t, r))
+
+    def get(self, k):
+        f, v = self.fd[k], self.vars.get(k)
+        if k in self.multi:
+            return [self.multi[k][i] for i in self.combos[k].curselection()]
+        if f["t"] in ("choice", "img", "rule"):
+            return self.maps[k].get(v.get(), "")
+        if f["t"] in ("rel", "pt", "area"):
+            return self.vals.get(k)
+        return v.get()
+
+    def ok(self):
+        res = {}
+        for f in self.fields:
+            val = self.get(f["k"])
+            if f["t"] == "num":
+                s = str(val).strip()
+                val = 0.0 if not s else num(s, None)
+                if val is None:
+                    messagebox.showerror(APP_TITLE, "«%s» باید عدد باشد." % f["l"], parent=self)
+                    return
+            if f.get("req") and (val in ("", None) or val == []):
+                messagebox.showerror(APP_TITLE, "«%s» را پر یا انتخاب کنید." % f["l"], parent=self)
+                return
+            res[f["k"]] = val
+        err = self.check(res) if self.check else None
+        if err:
+            messagebox.showerror(APP_TITLE, err, parent=self)
+            return
+        self.res = res
+        self.destroy()
 
 
-# ------------------------------------------------------------------ paths, config, files
-def base_dir():
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+# ------------------------------------------------------------------ three-step rule editor
+class RuleEditor(tk.Toplevel):
+    HEADS = ["مرحله ۱ از ۳ — چه ببینم؟ (شرط‌ها)", "مرحله ۲ از ۳ — چه کار کنم؟ (کارها، به ترتیب)", "مرحله ۳ از ۳ — تمام: نام و گزینه‌ها"]
 
+    def __init__(self, app, rule, is_new):
+        super().__init__(app.top())
+        self.app, self.r, self.res, self.lists, self.step = app, copy.deepcopy(rule), None, {}, 0
+        self.title("قانون جدید" if is_new else "ویرایش قانون")
+        self.transient(app.root)
+        self.geometry("540x600+%d+%d" % (app.root.winfo_rootx() + 20, app.root.winfo_rooty() + 30))
+        self.head = tk.Label(self, font=BOLD, bg="#eeeeee", pady=6)
+        self.head.pack(fill="x", padx=10, pady=8)
+        nav = tk.Frame(self)
+        nav.pack(side="bottom", fill="x", padx=10, pady=8)
+        tk.Button(nav, text="لغو", font=FONT, width=8, command=self.destroy).pack(side="right")
+        tk.Button(nav, text="ذخیره", font=FONT, width=8, bg="#17803d", fg="white", command=self.save).pack(side="right", padx=6)
+        self.b_next = tk.Button(nav, text="بعدی ◀", font=FONT, width=8, command=lambda: self.show(self.step + 1))
+        self.b_next.pack(side="left")
+        self.b_prev = tk.Button(nav, text="▶ قبلی", font=FONT, width=8, command=lambda: self.show(self.step - 1))
+        self.b_prev.pack(side="left", padx=6)
+        self.body = tk.Frame(self)
+        self.body.pack(fill="both", expand=True, padx=10)
+        self.pages = [self.page_see(), self.page_do(), self.page_end()]
+        self.refresh("conds")
+        self.refresh("acts")
+        self.show(0)
+        self.grab_set()
+        self.wait_window(self)
 
-def img_dir():
-    return base_dir() / "images"
+    def show(self, i):
+        self.step = min(2, max(0, i))
+        for j, p in enumerate(self.pages):
+            p.pack_forget()
+            if j == self.step:
+                p.pack(fill="both", expand=True)
+        self.head.configure(text=self.HEADS[self.step])
+        self.b_prev.configure(state="normal" if self.step else "disabled")
+        self.b_next.configure(state="normal" if self.step < 2 else "disabled")
 
+    # --- list pages
+    def list_page(self, key, intro, adders):
+        fr = tk.Frame(self.body)
+        tk.Label(fr, text=intro, font=SMALL, fg=GRAY, wraplength=490, justify="right", anchor="e").pack(fill="x", pady=(0, 4))
+        lb = tk.Listbox(fr, height=10, font=FONT, activestyle="none", exportselection=False)
+        lb.pack(fill="both", expand=True)
+        lb.bind("<Double-Button-1>", lambda e: self.edit(key))
+        bar = tk.Frame(fr)
+        bar.pack(fill="x", pady=4)
+        mb = tk.Menubutton(bar, text="+ افزودن ▾", font=FONT, relief="raised")
+        menu = tk.Menu(mb, tearoff=0)
+        mb["menu"] = menu
+        for label, fn in adders:
+            menu.add_command(label=label, command=fn)
+        mb.pack(side="right", padx=2)
+        for txt, fn in [("ویرایش", lambda: self.edit(key)), ("حذف", lambda: self.delete(key)),
+                        ("▲", lambda: self.move(key, -1)), ("▼", lambda: self.move(key, 1))]:
+            tk.Button(bar, text=txt, font=SMALL, command=fn).pack(side="right", padx=2)
+        self.lists[key] = lb
+        return fr
 
-def new_rule(name=""):
-    return {"id": new_id("r"), "name": name, "on": True, "join": "and", "conds": [], "acts": [],
-            "times": 1, "gap": 0.0, "prio": 0, "by": "score", "tie": "top", "area": None,
-            "timeout": 0.0, "confirm": 1}
+    def page_see(self):
+        fr = self.list_page("conds", "شرط‌ها تعیین می‌کنند قانون کِی اجرا شود. اگر هیچ شرطی نگذارید، قانون بلافاصله بعد از شروع "
+                            "اجرا می‌شود. برای ویرایش روی یک شرط دو بار کلیک کنید.",
+                            [(lb, lambda k=k: self.add_cond(k)) for k, lb in COND_KINDS])
+        jf = tk.Frame(fr)
+        jf.pack(fill="x")
+        self.v_join = tk.StringVar(value=self.r.get("join", "and"))
+        tk.Radiobutton(jf, text="همه‌ی شرط‌ها (و)", variable=self.v_join, value="and", font=FONT).pack(side="right")
+        tk.Radiobutton(jf, text="یکی از آن‌ها (یا)", variable=self.v_join, value="or", font=FONT).pack(side="right", padx=10)
+        return fr
 
+    def page_do(self):
+        ads = [(lb, lambda k=k: self.add_act(k)) for k, lb in ACT_KINDS]
+        ads.insert(0, ("کلیک کنار تصویر (کشیدن دو کادر: تصویر و هدف)", self.quick_two))
+        return self.list_page("acts", "کارها از بالا به پایین اجرا می‌شوند. با ▲ و ▼ ترتیب را عوض کنید.", ads)
 
-def fix_cfg(cfg):
-    """Make any loaded dict a valid config (missing keys get defaults)."""
-    if not isinstance(cfg, dict):
-        cfg = {}
-    st = dict(SETTINGS)
-    st.update(cfg.get("settings") or {})
-    cfg["settings"] = st
-    cfg["v"] = 2
-    cfg["images"] = [{**m, "id": str(m["id"]), "name": str(m.get("name") or m["id"]),
-                      "file": str(m.get("file") or "")} for m in cfg.get("images", [])
-                     if isinstance(m, dict) and m.get("id")]
-    rules = []
-    for r in cfg.get("rules", []):
-        if isinstance(r, dict) and r.get("id"):
-            d = new_rule()
-            d.update(r)
-            d["conds"] = [c for c in d.get("conds") or [] if isinstance(c, dict) and c.get("t")]
-            d["acts"] = [a for a in d.get("acts") or [] if isinstance(a, dict) and a.get("t")]
-            rules.append(d)
-    cfg["rules"] = rules
-    return cfg
+    def refresh(self, key):
+        lb = self.lists[key]
+        lb.delete(0, "end")
+        fn = describe_cond if key == "conds" else describe_act
+        for i, it in enumerate(self.r[key], 1):
+            lb.insert("end", "%d.  %s" % (i, fn(self.app.cfg, it)))
 
+    def sel(self, key):
+        s = self.lists[key].curselection()
+        return s[0] if s else None
 
-def load_config():
-    try:
-        data = json.loads((base_dir() / CONFIG_NAME).read_text(encoding="utf-8"))
-    except Exception:
-        data = {}
-    return fix_cfg(data)
+    def delete(self, key):
+        i = self.sel(key)
+        if i is not None:
+            del self.r[key][i]
+            self.refresh(key)
 
+    def move(self, key, d):
+        i = self.sel(key)
+        if i is not None and 0 <= i + d < len(self.r[key]):
+            L = self.r[key]
+            L[i], L[i + d] = L[i + d], L[i]
+            self.refresh(key)
+            self.lists[key].selection_set(i + d)
 
-def save_config(cfg):
-    try:
-        (base_dir() / CONFIG_NAME).write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception:
-        pass
+    def edit(self, key):
+        i = self.sel(key)
+        if i is None:
+            return
+        it = self.r[key][i]
+        d = self.cond_form(it["t"], it) if key == "conds" else self.act_form(it["t"], it)
+        if d is not None:
+            self.r[key][i] = d
+            self.refresh(key)
+            self.lists[key].selection_set(i)
 
+    def add_cond(self, t):
+        d = self.cond_form(t, {})
+        if d is not None:
+            self.r["conds"].append(d)
+            self.refresh("conds")
 
-def write_log(line):
-    try:
-        with open(base_dir() / "autoclicker.log", "a", encoding="utf-8") as f:
-            f.write(time.strftime("%H:%M:%S ") + line + "\n")
-    except Exception:
-        pass
+    def add_act(self, t):
+        d = {"t": t} if t in ("shot", "bright", "sleep", "stop") else self.act_form(t, {})
+        if d is not None:
+            self.r["acts"].append(d)
+            self.refresh("acts")
 
+    def anchor(self, form=None):
+        return next((c["img"] for c in self.r["conds"] if c["t"] == "seen" and c.get("img")), None)
 
-def imread(path):
-    data = np.fromfile(str(path), dtype=np.uint8)  # works with Persian paths
-    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+    def quick_two(self):
+        name = simpledialog.askstring(APP_TITLE, "یک نام برای تصویر لنگر بنویسید (مثلاً «آیکون»):", parent=self)
+        if not name or not name.strip():
+            return
+        got = self.app.grab_rects(["دور تصویر لنگر (مثلاً آیکون) یک کادر بکشید", "حالا دور هدف (جای کلیک یا ناحیه‌ی عدد) یک کادر بکشید"])
+        if not got or len(got[0]) < 2:
+            return
+        (a, t), img = got[0][:2], got[1]
+        meta = self.app.store_crop(name.strip(), img, a)
+        if meta:
+            self.r["conds"].append({"t": "seen", "img": meta["id"]})
+            self.r["acts"].append({"t": "click", "mode": "rect", "rel": [t[0] - a[0], t[1] - a[1], t[2] - t[0], t[3] - t[1]]})
+            self.refresh("conds")
+            self.refresh("acts")
 
+    # --- condition / action forms
+    def cond_form(self, t, c):
+        ask = self.app.ask
+        imgf = {"k": "imgs", "l": "تصویر (چندتا هم می‌شود)", "t": "imgs", "req": True,
+                "h": "روی هر مورد کلیک کنید تا انتخاب یا لغو شود. اگر چند آیکون مختلف انتخاب کنید، دیدن هرکدام کافی است. «+ جدید»: ثبت از روی صفحه."}
+        if t in ("seen", "unseen"):
+            f, v = [imgf], {"imgs": seen_ids(c), "thr": c.get("thr", 0) or ""}
+            nl = near_list(c)
+            complex_near = len(nl) > 1 or any("imgs" in n for n in nl)  # e.g. the Black Friday profile: several images
+            if t == "seen" and not complex_near:
+                n = nl[0] if nl else {}
+                f += [{"k": "near_on", "l": "فقط اگر کنار تصویر دیگری باشد / نباشد", "t": "bool", "h": "مثلاً آیکون فقط کنار برچسب «۵۰٪»، یا نه کنار «ناموجود»."},
+                      {"k": "near_img", "l": "آن تصویر دیگر", "t": "img"},
+                      {"k": "near_want", "l": "شرط", "t": "choice", "o": [("1", "کنارش باشد"), ("0", "کنارش نباشد")]},
+                      {"k": "near_r", "l": "حداکثر فاصله (پیکسل)", "t": "num", "h": "با تغییر اندازه‌ی تصویر خودکار متناسب می‌شود."}]
+                v.update(near_on=bool(n.get("img")), near_img=n.get("img"), near_want="1" if n.get("want", True) else "0", near_r=n.get("radius", 300))
+            if t == "seen" and HAS_DIGITS:
+                nm = c.get("num") or {}
+                f += [{"k": "num_on", "l": "عدد کنار تصویر خوانده شود", "t": "bool", "h": "اول در «آموزش ارقام» نمونه‌ها را ثبت کنید."},
+                      {"k": "num_rel", "l": "ناحیه‌ی عدد", "t": "rel", "anchor": lambda form: (form.get("imgs") or [None])[0]},
+                      {"k": "num_list", "l": "اعداد مجاز", "t": "str", "h": "فهرست و بازه، مثلاً: 1000000-4000000, 4500000"},
+                      {"k": "num_fail", "l": "اگر عدد خوانده نشد", "t": "choice", "o": [("skip", "رد کن"), ("click", "کلیک کن")]}]
+                v.update(num_on=bool(nm), num_rel=nm.get("rel"), num_list=nm.get("list", ""), num_fail=nm.get("fail", "skip"))
+            f.append({"k": "thr", "l": "حداقل شباهت (۰ = پیش‌فرض)", "t": "num", "h": "اگر تصویر اشتباه تشخیص داده می‌شود بالاتر ببرید (مثلاً ۰٫۸۸)."})
+            note = "این شرط چند تصویر «کنار / نه کنار» دارد؛ آن‌ها اینجا نشان داده نمی‌شوند و بدون تغییر می‌مانند." if complex_near else ""
+            d = ask("شرط: تصویر " + ("دیده شود" if t == "seen" else "دیده نشود"), f, v, note=note)
+            if d is None:
+                return None
+            out = {"t": t, "img": d["imgs"][0]}
+            if len(d["imgs"]) > 1:
+                out["imgs"] = d["imgs"]
+            if d["thr"] > 0:
+                out["thr"] = min(0.99, d["thr"])
+            if complex_near:
+                out["near"] = c["near"]
+            elif t == "seen" and d["near_on"] and d["near_img"]:
+                out["near"] = {"img": d["near_img"], "radius": d["near_r"] or 300, "want": d["near_want"] == "1"}
+            if t == "seen" and HAS_DIGITS and d.get("num_on") and d.get("num_rel"):
+                out["num"] = {"rel": d["num_rel"], "list": d["num_list"], "fail": d["num_fail"]}
+            return out
+        if t == "rule":
+            f = [{"k": "rule", "l": "قانون", "t": "rule", "req": True, "exclude": self.r["id"]},
+                 {"k": "state", "l": "وضعیت", "t": "choice", "o": [("done", "انجام شده باشد"), ("notdone", "انجام نشده باشد"),
+                                                                    ("finished", "تمام شده باشد (انجام یا رد)")]}]
+            d = ask("شرط: قانون دیگر", f, {"rule": c.get("rule"), "state": c.get("state", "done")})
+            return None if d is None else {"t": t, "rule": d["rule"], "state": d["state"]}
+        if t == "after":
+            f = [{"k": "secs", "l": "چند ثانیه", "t": "num"},
+                 {"k": "from", "l": "از چه زمانی", "t": "choice", "o": lambda: [("start", "شروع اجرا")] + [
+                     (r["id"], "اجرای «%s»" % (r.get("name") or "؟")) for r in self.app.cfg["rules"] if r["id"] != self.r["id"]]}]
+            d = ask("شرط: گذشتن زمان", f, {"secs": c.get("secs", 5), "from": c.get("from", "start")})
+            return None if d is None else {"t": t, "secs": d["secs"], "from": d["from"]}
+        f = [{"k": "at", "l": "ساعت", "t": "str", "req": True, "h": "مثلاً 20:00؛ از این ساعت به بعد شرط برقرار است."}]
+        d = ask("شرط: ساعت مشخص", f, {"at": c.get("at", "")}, check=lambda r: None if parse_hhmm(r["at"]) else "ساعت باید به شکل 20:00 باشد.")
+        return None if d is None else {"t": t, "at": d["at"].strip()}
 
-def imwrite(path, img):
-    ok, buf = cv2.imencode(".png", img)
-    if ok:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        buf.tofile(str(path))
+    def act_form(self, t, a):
+        ask = self.app.ask
+        if t == "click":
+            f = [{"k": "mode", "l": "کجا کلیک شود", "t": "choice", "o": [("match", "وسط تصویر دیده‌شده"), ("rect", "داخل کادر کنار تصویر"), ("xy", "نقطه‌ی ثابت روی صفحه")]},
+                 {"k": "rel", "l": "کادر کنار تصویر", "t": "rel", "anchor": self.anchor, "h": "فقط برای حالت «داخل کادر». برنامه فاصله و اندازه را نسبت به تصویر ذخیره می‌کند."},
+                 {"k": "xy", "l": "نقطه‌ی ثابت", "t": "pt", "h": "فقط برای حالت «نقطه‌ی ثابت»."},
+                 {"k": "button", "l": "دکمه", "t": "choice", "o": [("left", "چپ"), ("right", "راست"), ("middle", "وسط")]},
+                 {"k": "double", "l": "کلیک دوبل", "t": "bool"},
+                 {"k": "rand", "l": "نقطه‌ی تصادفی داخل کادر", "t": "bool"}]
+            v = {"mode": a.get("mode", "match"), "rel": a.get("rel"), "xy": a.get("xy"), "button": a.get("button", "left"),
+                 "double": a.get("double", False), "rand": a.get("rand", False)}
 
+            def chk(r):
+                if r["mode"] == "rect" and not r["rel"]:
+                    return "کادر کنار تصویر را بکشید."
+                if r["mode"] == "xy" and not r["xy"]:
+                    return "نقطه‌ی ثابت را انتخاب کنید."
+                return None
+            d = ask("کار: کلیک", f, v, check=chk)
+            return None if d is None else {"t": t, **{k: d[k] for k in ("mode", "button", "double", "rand")}, "rel": d["rel"], "xy": d["xy"]}
+        specs = {"type": ([{"k": "text", "l": "متن یا عدد", "t": "str", "h": "فارسی هم پشتیبانی می‌شود. {num} = عدد خوانده‌شده."}], "text"),
+                 "key": ([{"k": "keys", "l": "کلید", "t": "str", "req": True, "h": "مثلاً enter یا tab یا ctrl+a یا ctrl+shift+s یا f5"}], "keys"),
+                 "scroll": ([{"k": "amount", "l": "مقدار", "t": "num", "h": "مثبت = بالا، منفی = پایین (هر ۱ = یک گام چرخ ماوس)."}], "amount"),
+                 "wait": ([{"k": "secs", "l": "ثانیه", "t": "num"}], "secs"),
+                 "halo": ([{"k": "text", "l": "متن هاله", "t": "str"}], "text"),
+                 "run": ([{"k": "rule", "l": "قانون", "t": "rule", "req": True, "exclude": self.r["id"]}], "rule"),
+                 "refresh": ([{"k": "wait", "l": "صبر بعد از رفرش (ثانیه)", "t": "num", "h": "زمان بارگذاری صفحه، قبل از کار بعدی."}], None),
+                 "scan": ([{"k": "speed", "l": "سرعت (گام چرخ ماوس در ثانیه)", "t": "num",
+                            "h": "هر گام حدود ۱۰۰ پیکسل. ۳ = آرام، ۸ = سریع. اگر آیکون را وسط پیمایش از دست می‌دهد، کمتر کنید."},
+                           {"k": "dir", "l": "جهت", "t": "choice", "o": [("down", "به پایین"), ("up", "به بالا")]},
+                           {"k": "end", "l": "پایان پیمایش", "t": "choice",
+                            "o": [("bottom", "وقتی صفحه دیگر پایین‌تر نرفت"), ("time", "فقط با حداکثر زمان")]},
+                           {"k": "max_secs", "l": "حداکثر زمان پیمایش (ثانیه)", "t": "num", "h": "جلوی پیمایش بی‌پایان را می‌گیرد."},
+                           {"k": "watch", "l": "با آماده شدن این قانون‌ها بایست و اجرا کن", "t": "rules", "exclude": self.r["id"],
+                            "h": "مثلاً قانون «حراج‌جمعه»: پیمایش می‌ایستد، اطمینان می‌گیرد، کلیک می‌کند و بقیه‌ی کارهای این قانون انجام نمی‌شود."},
+                           {"k": "settle", "l": "مکث بعد از ایستادن (ثانیه)", "t": "num", "h": "تا صفحه کاملاً بایستد و تصویر دقیق دیده شود."},
+                           {"k": "still_secs", "l": "چند ثانیه ثابت ماندن یعنی انتهای صفحه", "t": "num",
+                            "h": "اگر صفحه جاهای خالی طولانی دارد، بیشتر کنید."},
+                           {"k": "region", "l": "ناحیه‌ی بررسی تغییر صفحه", "t": "area",
+                            "h": "اختیاری. اگر بخشی از صفحه همیشه متحرک است (ویدیو)، فقط ناحیه‌ی ثابت را بکشید."},
+                           {"k": "center", "l": "ماوس وسط صفحه برود", "t": "bool", "h": "چرخ ماوس روی پنجره‌ای کار می‌کند که ماوس روی آن است."}], None),
+                 "sound": ([{"k": "kind", "l": "نوع بوق", "t": "choice", "o": [("hit", "دیدن"), ("done", "پایان"), ("fail", "مشکل"), ("none", "بدون بوق")]},
+                            {"k": "text", "l": "جمله‌ی انگلیسی", "t": "str", "h": "خالی = فقط بوق. صدای فارسی روی ویندوز معمولاً نصب نیست."}], None)}
+        f, key = specs[t]
+        d = ask("کار: " + dict(ACT_KINDS)[t], f, {"kind": "hit", "amount": -3, "secs": 1, "speed": 3, "dir": "down", "end": "bottom", "max_secs": 180,
+                                                         "settle": 0.3, "still_secs": 1.0, "center": True, "wait": 2, **a},
+                check=(lambda r: self.bad_keys(r["keys"])) if t == "key" else ((lambda r: None if r["speed"] > 0 else "سرعت باید بیشتر از صفر باشد") if t == "scan" else None))
+        if d is None:
+            return None
+        if t == "key":
+            d["keys"] = d["keys"].strip()
+        return {"t": t, **d}
 
-def parse_hhmm(text):
-    try:
-        h, m = str(text).strip().split(":")
-        h, m = int(h), int(m)
-        return (h, m) if 0 <= h < 24 and 0 <= m < 60 else None
-    except Exception:
+    def bad_keys(self, spec):
+        try:
+            parse_keys(spec)
+        except ValueError:
+            return "نام کلید درست نیست. نمونه: enter ، tab ، ctrl+a ، f5"
         return None
 
+    # --- step 3
+    def page_end(self):
+        fr, r = tk.Frame(self.body), self.r
+        self.vv = {k: tk.StringVar(value=str(r.get(k, d))) for k, d in
+                   (("name", ""), ("times", 1), ("gap", 0), ("prio", 0), ("timeout", 0), ("confirm", 1))}
+        self.v_on = tk.BooleanVar(value=r.get("on", True))
+        self.v_opt = tk.BooleanVar(value=bool(r.get("opt", False)))
+        by = BY_LABELS + MORE_BY
+        self.by_map = {lb: k for k, lb in by}
+        self.v_by = tk.StringVar(value=dict((k, lb) for k, lb in by).get(r.get("by", "score"), by[0][1]))
+        self.v_tie = tk.StringVar(value=dict(BY_LABELS).get(r.get("tie", "top"), "بالاترین موقعیت"))
+        self.area = r.get("area")
 
-def mon_index(sct, idx):
-    try:
-        idx = int(idx)
-    except (TypeError, ValueError):
-        return 1
-    return idx if 1 <= idx < len(sct.monitors) else 1
+        def row(parent, label, widget_fn, hint=""):
+            b = tk.Frame(parent)
+            b.pack(fill="x", pady=3)
+            tk.Label(b, text=label, font=FONT, anchor="e", wraplength=250, justify="right").pack(side="right", padx=(8, 0))
+            widget_fn(b).pack(side="left", fill="x", expand=True)
+            if hint:
+                tk.Label(parent, text=hint, font=SMALL, fg=GRAY, anchor="e", justify="right", wraplength=480).pack(fill="x")
+        row(fr, "نام قانون", lambda p: tk.Entry(p, textvariable=self.vv["name"], font=FONT, justify="center"))
+        row(fr, "تعداد دفعات اجرا", lambda p: tk.Entry(p, textvariable=self.vv["times"], font=FONT, width=8, justify="center"),
+            "۱ = یک بار. ۰ = تا وقتی دیده می‌شود دوباره و دوباره.")
+        tk.Checkbutton(fr, text="قانون روشن باشد", variable=self.v_on, font=FONT).pack(anchor="e", pady=4)
+        self.v_adv = tk.BooleanVar(value=False)
+        tk.Checkbutton(fr, text="گزینه‌های پیشرفته", variable=self.v_adv, font=FONT, command=self.toggle_adv).pack(anchor="e")
+        self.adv = tk.LabelFrame(fr, text=" پیشرفته ", font=SMALL, labelanchor="ne")
+        row(self.adv, "فاصله‌ی بین اجراها (ثانیه)", lambda p: tk.Entry(p, textvariable=self.vv["gap"], font=FONT, width=8, justify="center"))
+        row(self.adv, "مهلت رد شدن (ثانیه، ۰ = بدون مهلت)", lambda p: tk.Entry(p, textvariable=self.vv["timeout"], font=FONT, width=8, justify="center"),
+            "اگر شرط‌های «قانون/زمان» برقرار شده ولی تصویر تا این مدت دیده نشد، قانون رد می‌شود و بقیه ادامه می‌دهند.")
+        tk.Checkbutton(self.adv, text="اختیاری: برای تمام شدن اجرا لازم نیست", variable=self.v_opt, font=FONT).pack(anchor="e")
+        row(self.adv, "تعداد دیدن پشت‌سرهم برای تأیید", lambda p: tk.Entry(p, textvariable=self.vv["confirm"], font=FONT, width=8, justify="center"))
+        row(self.adv, "اولویت این قانون (عدد بزرگ‌تر زودتر)", lambda p: tk.Entry(p, textvariable=self.vv["prio"], font=FONT, width=8, justify="center"))
+        row(self.adv, "اگر چند تصویر هم‌زمان دیده شد", lambda p: ttk.Combobox(p, textvariable=self.v_by, values=[lb for _, lb in by], state="readonly", font=FONT))
+        row(self.adv, "در حالت تساوی", lambda p: ttk.Combobox(p, textvariable=self.v_tie, values=[lb for _, lb in BY_LABELS], state="readonly", font=FONT))
+        ab = tk.Frame(self.adv)
+        ab.pack(fill="x", pady=3)
+        self.area_lb = tk.Label(ab, font=SMALL, fg=GRAY)
+        tk.Label(ab, text="ناحیه‌ی جست‌وجو", font=FONT).pack(side="right", padx=(8, 0))
+        tk.Button(ab, text="کشیدن ناحیه", font=SMALL, command=self.pick_area).pack(side="left")
+        tk.Button(ab, text="کل صفحه", font=SMALL, command=lambda: self.set_area(None)).pack(side="left", padx=3)
+        self.area_lb.pack(side="left", padx=4)
+        self.set_area(self.area)
+        return fr
 
-
-class ImageStore:
-    """Loads library images (user files, or embedded base64 for built-in ones)."""
-
-    def __init__(self):
-        self.raw = {}
-
-    def load(self, meta):
-        k = meta["id"]
-        if k not in self.raw:
-            img = None
-            try:
-                if meta.get("emb") and meta["emb"] in EMBEDDED:
-                    data = np.frombuffer(base64.b64decode(EMBEDDED[meta["emb"]]), dtype=np.uint8)
-                    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-                elif (img_dir() / meta["file"]).exists():
-                    img = imread(img_dir() / meta["file"])
-            except Exception:
-                img = None
-            self.raw[k] = img
-        return self.raw[k]
-
-
-# ------------------------------------------------------------------ image matching
-def best_match(frame, tpl):
-    th, tw = tpl.shape[:2]
-    if frame.shape[0] < th or frame.shape[1] < tw:
-        return 0.0, (0, 0)
-    res = cv2.matchTemplate(frame, tpl, cv2.TM_CCOEFF_NORMED)
-    res = np.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
-    _, mx, _, loc = cv2.minMaxLoc(res)
-    return float(mx), loc
-
-
-def all_matches(frame, tpl, thr, limit=12):
-    """Every place the template is seen with similarity >= thr: [(score, (x, y)), ...] best first."""
-    th, tw = tpl.shape[:2]
-    if frame.shape[0] < th or frame.shape[1] < tw:
-        return []
-    res = cv2.matchTemplate(frame, tpl, cv2.TM_CCOEFF_NORMED)
-    res = np.nan_to_num(res, nan=0.0, posinf=0.0, neginf=0.0)
-    out = []
-    for _ in range(limit):
-        _, mx, _, loc = cv2.minMaxLoc(res)
-        if mx < thr:
-            break
-        out.append((float(mx), loc))
-        res[max(0, loc[1] - th // 2):loc[1] + th // 2 + 1, max(0, loc[0] - tw // 2):loc[0] + tw // 2 + 1] = -1.0
-    return out
-
-
-def scaled(raw, s):
-    if abs(s - 1.0) < 0.01:
-        return raw
-    return cv2.resize(raw, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC if s > 1 else cv2.INTER_AREA)
-
-
-class Finder:
-    """Searches one image at several sizes. The last successful size is tried first and one other size
-    is probed per call, so the loop stays fast but every size is covered after a few calls."""
-
-    def __init__(self, raw, base=1.0):
-        self.raw, self.base, self.hint = raw, float(base), float(base)
-        self.cache = {}
-        self.i = 0
-
-    def tpl(self, s):
-        k = round(s, 3)
-        if k not in self.cache:
-            self.cache[k] = scaled(self.raw, s)
-        return self.cache[k]
-
-    def probe_scale(self):
-        cs = self.base * MULTS[self.i % len(MULTS)]
-        self.i += 1
-        return cs
-
-    def match(self, frame, thr):
-        """Best single match: (score, loc, template used)."""
-        t = self.tpl(self.hint)
-        sc, loc = best_match(frame, t)
-        best = (sc, loc, t)
-        if sc >= thr:
-            return best
-        cs = self.probe_scale()
-        if abs(cs - self.hint) > 0.005:
-            t2 = self.tpl(cs)
-            if min(t2.shape[:2]) >= 8:
-                sc2, loc2 = best_match(frame, t2)
-                if sc2 > sc:
-                    best = (sc2, loc2, t2)
-                if sc2 >= thr:
-                    self.hint = cs
-        return best
-
-    def find_all(self, frame, thr, limit=12):
-        """All matches at the current size (or a newly found one): [(score, loc, template), ...]."""
-        t = self.tpl(self.hint)
-        hits = all_matches(frame, t, thr, limit)
-        if not hits:
-            cs = self.probe_scale()
-            if abs(cs - self.hint) > 0.005:
-                t2 = self.tpl(cs)
-                if min(t2.shape[:2]) >= 8:
-                    h2 = all_matches(frame, t2, thr, limit)
-                    if h2:
-                        self.hint, t, hits = cs, t2, h2
-        return [(sc, loc, t) for sc, loc in hits]
-
-
-# ------------------------------------------------------------------ input backends
-VK = {"enter": 0x0D, "tab": 0x09, "esc": 0x1B, "escape": 0x1B, "space": 0x20, "backspace": 0x08,
-      "delete": 0x2E, "del": 0x2E, "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
-      "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27, "insert": 0x2D,
-      "ctrl": 0x11, "control": 0x11, "alt": 0x12, "shift": 0x10, "win": 0x5B}
-for _i in range(1, 13):
-    VK["f%d" % _i] = 0x6F + _i
-EXT_KEYS = {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E}
-MOUSE_FLAGS = {"left": (0x2, 0x4), "right": (0x8, 0x10), "middle": (0x20, 0x40)}
-
-
-def parse_keys(spec):
-    """'ctrl+shift+s' -> [vk, ...]; raises ValueError for unknown names."""
-    out = []
-    for p in str(spec).lower().split("+"):
-        p = p.strip()
-        if p in VK:
-            out.append(VK[p])
-        elif len(p) == 1 and p.isalnum() and p.isascii():
-            out.append(ord(p.upper()))
+    def toggle_adv(self):
+        if self.v_adv.get():
+            self.adv.pack(fill="x", pady=4)
         else:
-            raise ValueError(p)
-    if not out:
-        raise ValueError(spec)
-    return out
+            self.adv.pack_forget()
 
+    def set_area(self, a):
+        self.area = a
+        self.area_lb.configure(text="کل صفحه" if not a else "ناحیه‌ی %d×%d" % (a[2] - a[0], a[3] - a[1]))
 
-class NullIO:
-    """Records calls instead of touching the system (tests, non-Windows)."""
+    def pick_area(self):
+        got = self.app.grab_rects(["ناحیه‌ای را که باید جست‌وجو شود بکشید"])
+        if got:
+            self.set_area(list(got[0][0]))
 
-    def __init__(self):
-        self.calls = []
-        self.pos = (1, 1)
-
-    def cursor_pos(self):
-        return self.pos
-
-    def click(self, x, y, button="left", double=False):
-        self.calls.append(("click", int(x), int(y), button, bool(double)))
-
-    def type_text(self, text):
-        self.calls.append(("type", text))
-
-    def key(self, spec):
-        parse_keys(spec)
-        self.calls.append(("key", spec))
-
-    def scroll(self, amount):
-        self.calls.append(("scroll", amount))
-
-    def move(self, x, y):
-        self.calls.append(("move", int(x), int(y)))
-
-    def foreground_is_me(self):
-        return False
-
-
-if IS_WIN:
-    class _POINT(ctypes.Structure):
-        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-    class _KI(ctypes.Structure):
-        _fields_ = [("wVk", ctypes.c_ushort), ("wScan", ctypes.c_ushort), ("dwFlags", ctypes.c_ulong),
-                    ("time", ctypes.c_ulong), ("dwExtraInfo", ctypes.c_size_t)]
-
-    class _MI(ctypes.Structure):
-        _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", ctypes.c_ulong),
-                    ("dwFlags", ctypes.c_ulong), ("time", ctypes.c_ulong), ("dwExtraInfo", ctypes.c_size_t)]
-
-    class _IU(ctypes.Union):
-        _fields_ = [("ki", _KI), ("mi", _MI)]
-
-    class _INPUT(ctypes.Structure):
-        _fields_ = [("type", ctypes.c_ulong), ("u", _IU)]
-
-    class WinIO(NullIO):
-        def cursor_pos(self):
-            p = _POINT()
-            user32.GetCursorPos(ctypes.byref(p))
-            return p.x, p.y
-
-        def click(self, x, y, button="left", double=False):
-            user32.SetCursorPos(int(x), int(y))
-            time.sleep(0.02)
-            dn, up = MOUSE_FLAGS.get(button, (2, 4))
-            for _ in range(2 if double else 1):
-                user32.mouse_event(dn, 0, 0, 0, 0)
-                time.sleep(0.03)
-                user32.mouse_event(up, 0, 0, 0, 0)
-                time.sleep(0.05 if double else 0)
-
-        def _send(self, vk, scan, flags):
-            inp = _INPUT(1, _IU(ki=_KI(vk, scan, flags, 0, 0)))
-            user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
-
-        def type_text(self, text):
-            """Unicode typing (Persian included) one UTF-16 unit at a time."""
-            for ch in str(text):
-                if ch == "\n":
-                    self.key("enter")
-                    continue
-                data = ch.encode("utf-16-le")
-                for i in range(0, len(data), 2):
-                    unit = data[i] | (data[i + 1] << 8)
-                    self._send(0, unit, 0x4)
-                    self._send(0, unit, 0x6)
-                time.sleep(0.006)
-
-        def key(self, spec):
-            vks = parse_keys(spec)
-            for vk in vks:
-                user32.keybd_event(vk, 0, 1 if vk in EXT_KEYS else 0, 0)
-            time.sleep(0.02)
-            for vk in reversed(vks):
-                user32.keybd_event(vk, 0, (1 if vk in EXT_KEYS else 0) | 2, 0)
-
-        def scroll(self, amount):
-            user32.mouse_event(0x0800, 0, 0, int(round(float(amount) * 120)), 0)
-
-        def move(self, x, y):
-            user32.SetCursorPos(int(x), int(y))
-
-        def foreground_is_me(self):
-            buf = ctypes.create_unicode_buffer(256)
-            user32.GetWindowTextW(user32.GetForegroundWindow(), buf, 256)
-            return APP_TITLE in buf.value
-else:
-    WinIO = NullIO
-
-
-# ------------------------------------------------------------------ sound, speech, brightness, sleep
-_beep_gen = [0]
-_speaker = [None]
-BEEP_SEQS = {
-    "hit": [(880, 250), (0, 80), (880, 250), (0, 80), (1175, 500), (0, 300)],
-    "done": [(784, 400), (0, 80), (988, 400), (0, 80), (1175, 700), (0, 300)],
-    "fail": [(330, 500), (0, 80), (220, 700), (0, 300)],
-}
-SPEAK_SCRIPT = (
-    "Add-Type -AssemblyName System.Speech;"
-    "[Console]::InputEncoding = [System.Text.Encoding]::UTF8;"
-    "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
-    "try { $s.SelectVoiceByHints('NotSet','NotSet',0,[System.Globalization.CultureInfo]'en-US') } catch {};"
-    "$s.Volume = 100;"
-    "while ($true) { $l = [Console]::In.ReadLine(); if ($l -eq $null) { break }; [void]$s.Speak($l) }"
-)
-
-
-def prewarm_speech():
-    """Starts a hidden PowerShell ahead of time so sentences are spoken without delay."""
-    if not IS_WIN:
-        return
-    p = _speaker[0]
-    if p is not None and p.poll() is None:
-        return
-    try:
-        _speaker[0] = subprocess.Popen(
-            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", SPEAK_SCRIPT],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=0x08000000)
-    except Exception:
-        _speaker[0] = None
-
-
-def stop_speech():
-    p = _speaker[0]
-    _speaker[0] = None
-    if p is not None:
-        try:
-            p.kill()
-        except Exception:
-            pass
-
-
-def _speak(text):
-    prewarm_speech()
-    p = _speaker[0]
-    if p is None or p.stdin is None:
-        return
-    try:
-        p.stdin.write((text + "\n").encode("utf-8", "ignore"))
-        p.stdin.flush()
-    except Exception:
-        _speaker[0] = None
-
-
-def announce(kind, text, st):
-    """Optional spoken sentence, then optional beeps (kind: hit / done / fail)."""
-    if not IS_WIN:
-        return
-    import winsound
-    speak_on = bool(st.get("speak", True)) and bool(text)
-    _beep_gen[0] += 1
-    gen = _beep_gen[0]
-    seq = BEEP_SEQS.get(kind)
-
-    def _run():
-        if speak_on:
-            _speak(text)
-        if not st.get("beep", True) or not seq:
+    def save(self):
+        r, v = self.r, self.vv
+        r["name"] = v["name"].get().strip() or "قانون بدون نام"
+        r["on"], r["join"], r["area"], r["opt"] = bool(self.v_on.get()), self.v_join.get(), self.area, bool(self.v_opt.get())
+        r["times"], r["gap"], r["timeout"] = int(num(v["times"].get(), 1)), num(v["gap"].get()), num(v["timeout"].get())
+        r["confirm"], r["prio"] = max(1, int(num(v["confirm"].get(), 1))), int(num(v["prio"].get()))
+        r["by"] = self.by_map.get(self.v_by.get(), "score")
+        r["tie"] = {lb: k for k, lb in BY_LABELS}.get(self.v_tie.get(), "top")
+        if not r["acts"] and not messagebox.askyesno(APP_TITLE, "این قانون هیچ کاری ندارد. باز هم ذخیره شود؟", parent=self):
             return
-        if speak_on:  # let the sentence finish before the beeps
-            end_wait = time.time() + min(4.0, 0.4 + 0.07 * len(text))
-            while time.time() < end_wait and _beep_gen[0] == gen:
-                time.sleep(0.05)
-        end = time.time() + max(0.3, float(st.get("beep_seconds", 3)))
-        while time.time() < end and _beep_gen[0] == gen:
-            for f, d in seq:
-                if time.time() >= end or _beep_gen[0] != gen:
-                    return
-                if f:
-                    winsound.Beep(f, d)
-                else:
-                    time.sleep(d / 1000)
-    threading.Thread(target=_run, daemon=True).start()
-
-
-def max_brightness():
-    """Screen brightness to 100%: laptop panel via WMI, external monitor via DDC/CI (background thread)."""
-    if not IS_WIN:
-        return
-
-    def _run():
-        try:
-            subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command",
-                 "(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1,100)"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=0x08000000, timeout=10)
-        except Exception:
-            pass
-        try:
-            dxva2 = ctypes.windll.dxva2
-
-            class _PHYS(ctypes.Structure):
-                _fields_ = [("h", wintypes.HANDLE), ("desc", ctypes.c_wchar * 128)]
-
-            dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-            dxva2.GetPhysicalMonitorsFromHMONITOR.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(_PHYS)]
-            dxva2.GetMonitorBrightness.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD),
-                                                   ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD)]
-            dxva2.SetMonitorBrightness.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-            dxva2.DestroyPhysicalMonitors.argtypes = [wintypes.DWORD, ctypes.POINTER(_PHYS)]
-            enum_proc = ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HANDLE, wintypes.HANDLE,
-                                           ctypes.c_void_p, wintypes.LPARAM)
-
-            def _cb(hmon, hdc, rect, lp):
-                try:
-                    n = wintypes.DWORD(0)
-                    if dxva2.GetNumberOfPhysicalMonitorsFromHMONITOR(hmon, ctypes.byref(n)) and n.value:
-                        arr = (_PHYS * n.value)()
-                        if dxva2.GetPhysicalMonitorsFromHMONITOR(hmon, n, arr):
-                            for pm in arr:
-                                lo, cur, hi = wintypes.DWORD(), wintypes.DWORD(), wintypes.DWORD()
-                                if dxva2.GetMonitorBrightness(pm.h, ctypes.byref(lo), ctypes.byref(cur), ctypes.byref(hi)):
-                                    dxva2.SetMonitorBrightness(pm.h, hi.value)
-                            dxva2.DestroyPhysicalMonitors(n, arr)
-                except Exception:
-                    pass
-                return 1
-
-            cb = enum_proc(_cb)
-            user32.EnumDisplayMonitors.argtypes = [ctypes.c_void_p, ctypes.c_void_p, enum_proc, wintypes.LPARAM]
-            user32.EnumDisplayMonitors(None, None, cb, 0)
-        except Exception:
-            pass
-    threading.Thread(target=_run, daemon=True).start()
-
-
-def sleep_computer():
-    """Puts the computer to Sleep (not Hibernate)."""
-    if not IS_WIN:
-        return
-
-    def _run():
-        try:
-            ctypes.windll.powrprof.SetSuspendState(ctypes.c_ubyte(0), ctypes.c_ubyte(0), ctypes.c_ubyte(0))
-        except Exception:
-            try:
-                subprocess.run(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"],
-                               creationflags=0x08000000, timeout=30)
-            except Exception:
-                pass
-    threading.Thread(target=_run, daemon=True).start()
-# ===== END OF PART 01 (lines: 566) =====
+        self.res = r
+        self.destroy()
+# ===== END OF PART 01 (lines: 588) =====
 
 
 # ------------------------------------------------------------------ screen capture and image library
@@ -575,8 +597,7 @@ class CaptureMixin:
         return Form(self, title, fields, values, note, check).res
 
     def grab_rects(self, labels):
-        """Shows a frozen screenshot full-screen; the user draws one 
-rectangle per label.
+        """Shows a frozen screenshot full-screen; the user draws one rectangle per label.
         Returns ([(x0, y0, x1, y1), ...] in monitor pixels, PIL image) or None if cancelled."""
         import mss
         from PIL import Image, ImageTk
@@ -598,8 +619,7 @@ rectangle per label.
         top.geometry("+%d+%d" % (mon["left"], mon["top"]))
         top.attributes("-fullscreen", True)
         top.attributes("-topmost", True)
-        cv = tk.Canvas(top, 
-cursor="crosshair", highlightthickness=0)
+        cv = tk.Canvas(top, cursor="crosshair", highlightthickness=0)
         cv.pack(fill="both", expand=True)
         top.update()
         cw, ch = cv.winfo_width(), cv.winfo_height()
@@ -622,8 +642,7 @@ cursor="crosshair", highlightthickness=0)
             if "p" not in st:
                 return
             x0, y0 = st.pop("p")
-            kx, ky = img.width / cw, 
-img.height / ch
+            kx, ky = img.width / cw, img.height / ch
             box = (int(min(x0, e.x) * kx), int(min(y0, e.y) * ky), int(max(x0, e.x) * kx), int(max(y0, e.y) * ky))
             if box[2] - box[0] < 6 or box[3] - box[1] < 6:
                 cv.delete(st.pop("r"))
@@ -649,8 +668,7 @@ img.height / ch
             g.grab_set()
         return (out, img) if len(out) == len(labels) else None
 
-    def store_crop(self, name, img, 
-rect):
+    def store_crop(self, name, img, rect):
         box = tuple(int(v) for v in rect)
         if box[2] - box[0] < 8 or box[3] - box[1] < 8:
             self.on_log("ناحیه خیلی کوچک بود؛ ذخیره نشد", "warn")
@@ -660,8 +678,7 @@ rect):
         meta["file"] = meta["id"] + ".png"
         imwrite(img_dir() / meta["file"], arr)
         self.snap()
-        
-self.cfg["images"].append(meta)
+        self.cfg["images"].append(meta)
         self.save()
         self.refresh_library()
         self.on_log("تصویر «%s» ثبت شد (%d×%d)" % (name, arr.shape[1], arr.shape[0]), "ok")
@@ -671,8 +688,7 @@ self.cfg["images"].append(meta)
         name = name or simpledialog.askstring(APP_TITLE, "یک نام برای این تصویر بنویسید (مثلاً «دکمه خرید»):", parent=self.top())
         if not name or not name.strip():
             return None
-        got = self.grab_rects(["دور «%s» 
-یک کادر بکشید" % name.strip()])
+        got = self.grab_rects(["دور «%s» یک کادر بکشید" % name.strip()])
         return self.store_crop(name.strip(), got[1], got[0][0]) if got else None
 
     def import_image_file(self, name=None, meta=None):
@@ -681,8 +697,7 @@ self.cfg["images"].append(meta)
         if not path:
             return None
         arr = imread(path)
-        if arr is None or 
-min(arr.shape[:2]) < 8:
+        if arr is None or min(arr.shape[:2]) < 8:
             messagebox.showerror(APP_TITLE, "این فایل تصویر معتبری نیست یا خیلی کوچک است.", parent=self.top())
             return None
         self.snap()
@@ -729,8 +744,7 @@ min(arr.shape[:2]) < 8:
                  anchor="e", wraplength=470, justify="right").pack(fill="x", padx=12, pady=(8, 2))
         self.lib = tk.Listbox(tab, height=7, font=FONT, activestyle="none", exportselection=False)
         self.lib.pack(fill="x", padx=12, pady=4)
-        self.lib.bind("<<ListboxSelect>>", 
-lambda e: self.show_preview())
+        self.lib.bind("<<ListboxSelect>>", lambda e: self.show_preview())
         pv = tk.Frame(tab, height=190, relief="groove", bd=1)
         pv.pack(fill="x", padx=12, pady=4)
         pv.pack_propagate(False)
@@ -739,8 +753,7 @@ lambda e: self.show_preview())
         bar = tk.Frame(tab)
         bar.pack(fill="x", padx=12, pady=4)
         for txt, fn in [("+ ثبت از روی صفحه", lambda: self.capture_image()), ("از فایل", lambda: self.import_image_file()),
-                        ("تعویض تصویر", 
-self.lib_replace), ("تغییر نام", self.lib_rename), ("حذف", self.lib_delete)]:
+                        ("تعویض تصویر", self.lib_replace), ("تغییر نام", self.lib_rename), ("حذف", self.lib_delete)]:
             tk.Button(bar, text=txt, font=SMALL, command=fn).pack(side="right", padx=2)
         self.refresh_library()
 
@@ -764,8 +777,7 @@ self.lib_replace), ("تغییر نام", self.lib_rename), ("حذف", self.lib_d
         keep = self.lib.curselection()
         self.lib.delete(0, "end")
         for i, m in enumerate(self.cfg["images"], 1):
-            self.lib.insert("end", "%d.  %s    (در %d قانون)" % (i, m["name"], 
-self.usage(m["id"])))
+            self.lib.insert("end", "%d.  %s    (در %d قانون)" % (i, m["name"], self.usage(m["id"])))
         sel = select if select is not None else (keep[0] if keep else None)
         if sel is not None and 0 <= sel < self.lib.size():
             self.lib.selection_set(sel)
@@ -778,8 +790,7 @@ self.usage(m["id"])))
         if not s:
             return
         try:
-            from PIL import Image, 
-ImageTk
+            from PIL import Image, ImageTk
             raw = ImageStore().load(self.cfg["images"][s[0]])
             if raw is None:
                 raise ValueError("missing")
@@ -813,8 +824,7 @@ ImageTk
 
     def lib_rename(self):
         m = self.lib_sel()
-        name = m and simpledialog.askstring(APP_TITLE, 
-"نام جدید:", initialvalue=m["name"], parent=self.root)
+        name = m and simpledialog.askstring(APP_TITLE, "نام جدید:", initialvalue=m["name"], parent=self.root)
         if name and name.strip():
             self.snap()
             m["name"] = name.strip()
@@ -853,16 +863,14 @@ class RulesMixin:
         tk.Entry(bar, textvariable=self.q_var, font=FONT, width=9, justify="center").pack(side="left")
         tk.Label(bar, text="جست‌وجو:", font=SMALL).pack(side="left", padx=3)
         wrap = tk.Frame(tab)
-        wrap.pack(fill="both", 
-expand=True, padx=8)
+        wrap.pack(fill="both", expand=True, padx=8)
         self.rc = tk.Canvas(wrap, highlightthickness=0)
         sb = ttk.Scrollbar(wrap, orient="vertical", command=self.rc.yview)
         self.rf = tk.Frame(self.rc)
         self.rf.bind("<Configure>", lambda e: self.rc.configure(scrollregion=self.rc.bbox("all")))
         self.rc_win = self.rc.create_window((0, 0), window=self.rf, anchor="nw")
         self.rc.bind("<Configure>", lambda e: self.rc.itemconfigure(self.rc_win, width=e.width))
-        self.rc.configure(yscrollcomma
-nd=sb.set)
+        self.rc.configure(yscrollcommand=sb.set)
         self.rc.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
         self.root.bind_all("<MouseWheel>", lambda e: self.rc.yview_scroll(int(-e.delta / 120), "units") if self.nb.index("current") == 0 else None)
@@ -880,22 +888,19 @@ nd=sb.set)
         at the bottom refresh and scroll again."""
         rules = self.cfg["rules"]
         if not rules:
-            messagebox.showinfo(APP_TITLE, "اول قانون هدف (مثلاً حراج‌جمعه) را بسازید: قالب‌ها ← «حراج‌جمعه کامل» یا «کلیک روی 
-یک تصویر».")
+            messagebox.showinfo(APP_TITLE, "اول قانون هدف (مثلاً حراج‌جمعه) را بسازید: قالب‌ها ← «حراج‌جمعه کامل» یا «کلیک روی یک تصویر».")
             return
         first = next((r for r in rules if "حراج" in (r.get("name") or "")), rules[0])
         f = [{"k": "watch", "l": "قانون هدف (با دیدن آن بایست و کلیک کن)", "t": "rule", "req": True},
              {"k": "speed", "l": "سرعت پیمایش (گام چرخ ماوس در ثانیه)", "t": "num", "h": "هر گام حدود ۱۰۰ پیکسل. ۳ = آرام، ۸ = سریع."},
              {"k": "end", "l": "پیمایش تا کجا", "t": "choice", "o": [("bottom", "تا انتهای صفحه"), ("time", "فقط تا حداکثر زمان")]},
              {"k": "max_secs", "l": "حداکثر زمان هر پیمایش (ثانیه)", "t": "num"},
-             {"k": "refresh", "l": "در انتهای 
-صفحه رفرش کن و دوباره پیمایش کن", "t": "bool"},
+             {"k": "refresh", "l": "در انتهای صفحه رفرش کن و دوباره پیمایش کن", "t": "bool"},
              {"k": "wait", "l": "صبر بعد از رفرش (ثانیه)", "t": "num", "h": "زمان بارگذاری صفحه."},
              {"k": "cycles", "l": "تعداد دورها (۰ = تا وقتی هدف پیدا شود)", "t": "num"}]
         d = self.ask("گشتن صفحه برای آیکون", f, {"watch": first["id"], "speed": 3, "end": "bottom", "max_secs": 180, "refresh": True, "wait": 3, "cycles": 0},
                      note="قانون جدید: صفحه با این سرعت پایین می‌رود. اگر قانون هدف دیده شد می‌ایستد، مطمئن می‌شود، کلیک می‌کند و بقیه‌ی مراحل ادامه پیدا می‌کنند.",
-                     check=lambda r: None if r["speed"] > 0 else "سرعت باید بیشتر 
-از صفر باشد")
+                     check=lambda r: None if r["speed"] > 0 else "سرعت باید بیشتر از صفر باشد")
         if not d:
             return
         r = new_rule("گشتن صفحه برای «%s»" % rule_name(self.cfg, d["watch"]))
@@ -904,8 +909,7 @@ nd=sb.set)
                       "settle": 0.3, "still_secs": 1.0, "center": True, "region": None}]
         if d["refresh"]:
             r["acts"].append({"t": "refresh", "wait": d["wait"]})
-        r["times"], r["gap"], r["opt"] = 
-int(d["cycles"]), 0.5, True
+        r["times"], r["gap"], r["opt"] = int(d["cycles"]), 0.5, True
         self.add_rule(r)
 
     def tpl_blackfriday(self):
@@ -927,8 +931,7 @@ int(d["cycles"]), 0.5, True
             w.destroy()
         q = self.q_var.get().strip()
         shown = 0
-        for i, r in 
-enumerate(self.cfg["rules"]):
+        for i, r in enumerate(self.cfg["rules"]):
             text = describe_rule(self.cfg, r)
             if q and q not in text and q not in r.get("name", ""):
                 continue
@@ -938,16 +941,14 @@ enumerate(self.cfg["rules"]):
             top = tk.Frame(fr)
             top.pack(fill="x")
             var = tk.BooleanVar(value=r.get("on", True))
-            tk.Checkbutton(top, 
-text="روشن", variable=var, font=SMALL, command=lambda r=r, v=var: self.toggle_rule(r, v)).pack(side="right")
+            tk.Checkbutton(top, text="روشن", variable=var, font=SMALL, command=lambda r=r, v=var: self.toggle_rule(r, v)).pack(side="right")
             tk.Label(top, text="%d. %s" % (i + 1, r.get("name") or "بدون نام"), font=BOLD, anchor="e",
                      fg="#222" if r.get("on", True) else "#999").pack(side="right", padx=6)
             tk.Label(fr, text=text, font=SMALL, wraplength=430, justify="right", anchor="e",
                      fg="#333" if r.get("on", True) else "#999").pack(fill="x")
             bar = tk.Frame(fr)
             bar.pack(fill="x", pady=(4, 0))
-            for txt, fn in [("ویرایش", 
-self.edit_rule), ("آزمایش", self.test_rule), ("کپی", self.copy_rule),
+            for txt, fn in [("ویرایش", self.edit_rule), ("آزمایش", self.test_rule), ("کپی", self.copy_rule),
                             ("▲", lambda i: self.move_rule(i, -1)), ("▼", lambda i: self.move_rule(i, 1)), ("حذف", self.delete_rule)]:
                 tk.Button(bar, text=txt, font=SMALL, command=lambda fn=fn, i=i: fn(i)).pack(side="right", padx=2)
         if not shown:
@@ -981,8 +982,7 @@ self.edit_rule), ("آزمایش", self.test_rule), ("کپی", self.copy_rule),
         self.snap()
         self.cfg["rules"].append(r)
         self.changed()
-        self.on_log("قانون «%s» اضافه شد" 
-% r["name"], "ok")
+        self.on_log("قانون «%s» اضافه شد" % r["name"], "ok")
 
     def new_rule_ui(self):
         d = RuleEditor(self, new_rule("قانون %d" % (len(self.cfg["rules"]) + 1)), True).res
@@ -1012,8 +1012,7 @@ self.edit_rule), ("آزمایش", self.test_rule), ("کپی", self.copy_rule),
 
     def delete_rule(self, i):
         r = self.cfg["rules"][i]
-        if 
-messagebox.askyesno(APP_TITLE, "قانون «%s» حذف شود؟" % r.get("name", "")):
+        if messagebox.askyesno(APP_TITLE, "قانون «%s» حذف شود؟" % r.get("name", "")):
             self.snap()
             del self.cfg["rules"][i]
             self.changed()
@@ -1039,8 +1038,7 @@ messagebox.askyesno(APP_TITLE, "قانون «%s» حذف شود؟" % r.get("name
             time.sleep(2.0)
             try:
                 lines, boxes, mon = runner.probe(r)
-                self.post(self.on_probe, 
-lines, boxes, mon)
+                self.post(self.on_probe, lines, boxes, mon)
             except Exception:
                 self.post(self.on_log, "خطا در آزمایش:\n" + traceback.format_exc(), "error")
                 self.post(self.root.deiconify)
@@ -1072,8 +1070,7 @@ lines, boxes, mon)
         (a, t), meta = got[0][:2], None
         meta = self.store_crop(name.strip(), got[1], a)
         if meta:
-            r = new_rule("کلیک کنار " + 
-meta["name"])
+            r = new_rule("کلیک کنار " + meta["name"])
             r["conds"], r["times"], r["gap"] = [{"t": "seen", "img": meta["id"]}], 0, 1.0
             r["acts"] = [{"t": "click", "mode": "rect", "rel": [t[0] - a[0], t[1] - a[1], t[2] - t[0], t[3] - t[1]]}]
             self.add_rule(r)
@@ -1099,14 +1096,12 @@ class SleepMixin:
         sl = tk.LabelFrame(tab, text=" خواب کامپیوتر ", font=FONT, labelanchor="ne")
         sl.pack(fill="x", padx=10, pady=8)
         tk.Label(sl, text="در ساعت تعیین‌شده یا چند ساعت دیگر، اجرا و همه‌ی کارها متوقف می‌شوند و کامپیوتر به حالت Sleep می‌رود. "
-                          "اگر هر دو پر باشند، هرکدام زودتر برسد. ۳۰ ثانیه قبل از خواب یک بوق 
-هشدار می‌زند و می‌توانید لغو کنید. "
+                          "اگر هر دو پر باشند، هرکدام زودتر برسد. ۳۰ ثانیه قبل از خواب یک بوق هشدار می‌زند و می‌توانید لغو کنید. "
                           "کار «خواب کامپیوتر» داخل قانون‌ها هم همین شمارش معکوس را دارد.",
                  font=SMALL, justify="right", wraplength=470, anchor="e").pack(fill="x", padx=8, pady=6)
         self.make_rows(sl, [("sleep_at", "رفتن به خواب در ساعت (مثلاً 02:30)", "hhmm"), ("sleep_hours", "یا چند ساعت دیگر (مثلاً 1٫5)", "float")])
         self.sleep_btn = tk.Button(sl, text="فعال‌سازی زمان‌بندی خواب", font=BOLD, command=self.toggle_sleep, pady=6)
-        self.sleep_btn.pack(fill="x", 
-padx=8, pady=(8, 4))
+        self.sleep_btn.pack(fill="x", padx=8, pady=(8, 4))
         self._sleep_btn_style = (self.sleep_btn.cget("bg"), self.sleep_btn.cget("fg"))
         self.sleep_info = tk.Label(sl, text="زمان‌بندی خواب غیرفعال است", font=FONT, anchor="e")
         self.sleep_info.pack(fill="x", padx=8, pady=(0, 4))
@@ -1114,8 +1109,7 @@ padx=8, pady=(8, 4))
 
     def toggle_sleep(self):
         if self.sleep_deadline:
-            self.cancel_sleep("زمان‌بندی 
-خواب لغو شد")
+            self.cancel_sleep("زمان‌بندی خواب لغو شد")
             return
         if not self.read_settings():
             return
@@ -1125,8 +1119,7 @@ padx=8, pady=(8, 4))
             lt = time.localtime(now)
             t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hm[0], hm[1], 0, 0, 0, -1))
             if t <= now:
-                t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1, hm[0], 
-hm[1], 0, 0, 0, -1))
+                t = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday + 1, hm[0], hm[1], 0, 0, 0, -1))
             cands.append(t)
         if st["sleep_hours"] > 0:
             cands.append(now + st["sleep_hours"] * 3600)
@@ -1191,8 +1184,7 @@ hm[1], 0, 0, 0, -1))
         self.root.after(1500, sleep_computer)
 
 
-# ------------------------------------------------------------------ profiles (a folder per 
-profile)
+# ------------------------------------------------------------------ profiles (a folder per profile)
 class ProfileMixin:
     def profile_names(self):
         d = base_dir() / "profiles"
@@ -1215,8 +1207,7 @@ class ProfileMixin:
         bad = set('/:*?"<>|' + chr(92))
         name = "".join(ch for ch in name if ch not in bad).strip().strip(".")
         if not name:
-            messagebox.showerror(APP_TITLE, 
-"این نام قابل استفاده نیست.")
+            messagebox.showerror(APP_TITLE, "این نام قابل استفاده نیست.")
             return
         d = base_dir() / "profiles" / name
         if d.exists():
@@ -1224,8 +1215,7 @@ class ProfileMixin:
                 return
             shutil.rmtree(d, ignore_errors=True)
         (d / "images").mkdir(parents=True, exist_ok=True)
-        (d / "profile.json").write_text(json.dumps(self.cfg, ensure_ascii=False, indent=1), 
-encoding="utf-8")
+        (d / "profile.json").write_text(json.dumps(self.cfg, ensure_ascii=False, indent=1), encoding="utf-8")
         n = 0
         for m in self.cfg["images"]:
             src = img_dir() / m["file"]
@@ -1238,8 +1228,7 @@ encoding="utf-8")
     def export_file(self):
         if not self.read_settings():
             return
-        path = filedialog.asksaveasfilename(parent=self.root, 
-defaultextension=".json", initialfile="profile.json",
+        path = filedialog.asksaveasfilename(parent=self.root, defaultextension=".json", initialfile="profile.json",
                                             filetypes=[("پروفایل اتو کلیکر", "*.json")])
         if path:
             try:
@@ -1270,8 +1259,7 @@ defaultextension=".json", initialfile="profile.json",
 
     def load_profile(self):
         if self.bot:
-            
-messagebox.showinfo(APP_TITLE, "اول اجرا را متوقف کنید، بعد پروفایل را بارگذاری کنید.")
+            messagebox.showinfo(APP_TITLE, "اول اجرا را متوقف کنید، بعد پروفایل را بارگذاری کنید.")
             return
         name, d = self.prof_var.get().strip(), None
         if not name:
@@ -1281,8 +1269,7 @@ messagebox.showinfo(APP_TITLE, "اول اجرا را متوقف کنید، بع�
         try:
             data = json.loads((d / "profile.json").read_text(encoding="utf-8"))
         except Exception:
-            
-messagebox.showerror(APP_TITLE, "این پروفایل پیدا نشد یا خراب است.")
+            messagebox.showerror(APP_TITLE, "این پروفایل پیدا نشد یا خراب است.")
             self.refresh_profiles()
             return
         if not messagebox.askyesno(APP_TITLE, "قانون‌ها، تصاویر و تنظیمات فعلی با پروفایل «%s» جایگزین می‌شود. ادامه؟" % name):
@@ -1292,8 +1279,7 @@ messagebox.showerror(APP_TITLE, "این پروفایل پیدا نشد یا خر
             try:
                 data = profiles.convert_legacy(data, d)
             except ValueError as e:
-                
-messagebox.showerror(APP_TITLE, str(e))
+                messagebox.showerror(APP_TITLE, str(e))
                 return
             self.on_log("این پروفایل قدیمی بود و به قانون‌ها تبدیل شد", "ok")
         for f in (d / "images").glob("*.png"):
@@ -1304,8 +1290,7 @@ messagebox.showerror(APP_TITLE, str(e))
         self.init_defaults()
         self.apply_cfg_to_ui()
         self.changed()
-        self.on_log("پروفایل «%s» بارگذاری 
-شد" % name, "ok")
+        self.on_log("پروفایل «%s» بارگذاری شد" % name, "ok")
 
     def delete_profile(self):
         name = self.prof_var.get().strip()
@@ -1315,8 +1300,7 @@ messagebox.showerror(APP_TITLE, str(e))
             self.on_log("پروفایل «%s» حذف شد" % name, "ok")
 
 
-# -------------------------------------
------------------------------ main window
+# ------------------------------------------------------------------ main window
 SPECS_BASIC = [("monitor", "شماره صفحه‌نمایش (۱ = اصلی)", "int"),
                ("threshold", "حداقل شباهت پیش‌فرض تصویر (۰٫۵ تا ۰٫۹۵)", "float"),
                ("refresh", "رفرش خودکار با F5 هر N ثانیه (۰ = خاموش)", "float"),
@@ -1331,16 +1315,14 @@ SPECS_ADV = [("countdown", "مهلت رفتن به پنجره‌ی هدف قبل
              ("scale", "مقیاس تصاویر آماده‌ی حراج‌جمعه (۰ = خودکار)", "float")]
 SPECS_SLEEP = [("sleep_at", "ساعت خواب", "hhmm"), ("sleep_hours", "ساعت تا خواب", "float")]
 BOOLS = [("beep", "صدای هشدار"), ("speak", "اعلام صوتی (انگلیسی)"), ("halo", "هاله‌ی قرمز دور صفحه"),
-         ("announce_end", "اعلام 
-پایان وقتی همه‌ی قانون‌ها تمام شد"), ("always_on_top", "پنجره همیشه روی بقیه")]
+         ("announce_end", "اعلام پایان وقتی همه‌ی قانون‌ها تمام شد"), ("always_on_top", "پنجره همیشه روی بقیه")]
 HK_KEYS = [("hk_start", "شروع"), ("hk_stop", "توقف"), ("hk_pause", "مکث / ادامه")]
 HK_CHOICES = ["F%d" % i for i in range(1, 13)] + ["ندارد"]
 HK_DEFAULT = {"hk_start": "F8", "hk_stop": "F8", "hk_pause": "F9"}
 LIMITS = {"threshold": (0.5, 0.95), "scale": (0.0, 5.0), "monitor": (1, 16), "tick": (0.005, 1.0), "beep_seconds": (1, 30)}
 
 
-class App(CaptureMixin, RulesMixin, SleepMixin, 
-ProfileMixin):
+class App(CaptureMixin, RulesMixin, SleepMixin, ProfileMixin):
     def __init__(self):
         if tk is None or not IS_WIN:
             raise SystemExit("این برنامه فقط روی ویندوز اجرا می‌شود.")
@@ -1362,8 +1344,7 @@ ProfileMixin):
         r.bind("<Control-z>", lambda e: None if isinstance(e.widget, (tk.Entry, ttk.Entry, ttk.Combobox)) else self.do_undo())
 
     def migrate_old(self):
-        """First start after the upgrade: 
-the old config.json of the Black Friday bot becomes rules."""
+        """First start after the upgrade: the old config.json of the Black Friday bot becomes rules."""
         old_p = base_dir() / "config.json"
         if (base_dir() / CONFIG_NAME).exists() or not old_p.exists():
             return None
@@ -1373,8 +1354,7 @@ the old config.json of the Black Friday bot becomes rules."""
                 return None
             self.cfg = profiles.convert_legacy(old, base_dir() / "templates_user")
             save_config(self.cfg)
-            return "تنظیمات و مراحل 
-قبلی حراج‌جمعه به %d قانون تبدیل شد (config.json دست‌نخورده ماند)" % len(self.cfg["rules"])
+            return "تنظیمات و مراحل قبلی حراج‌جمعه به %d قانون تبدیل شد (config.json دست‌نخورده ماند)" % len(self.cfg["rules"])
         except Exception:
             return None
 
@@ -1408,8 +1388,7 @@ the old config.json of the Black Friday bot becomes rules."""
                        command=self.quick_save, justify="right").pack(side="left")
         self.log = tk.Text(r, height=6, font=("Tahoma", 9), state="disabled", wrap="word")
         self.log.pack(side="bottom", fill="x", padx=12, pady=(4, 10))
-        for tag, col in (("hit", "#c0151a"), ("ok", "#17803d"), 
-("warn", "#b36b00"), ("error", "#c0151a")):
+        for tag, col in (("hit", "#c0151a"), ("ok", "#17803d"), ("warn", "#b36b00"), ("error", "#c0151a")):
             self.log.tag_configure(tag, foreground=col)
         tk.Button(r, text="خاموش کردن هاله‌ی قرمز", font=FONT, command=self.overlay.hide).pack(side="bottom", fill="x", padx=12, pady=2)
         self.stats = tk.Label(r, text="قانون‌های انجام‌شده: ۰   رفرش: ۰   زمان: ۰", font=SMALL, anchor="e")
@@ -1429,8 +1408,7 @@ the old config.json of the Black Friday bot becomes rules."""
         prow.pack(fill="x", padx=10, pady=6)
         tk.Label(prow, text="پروفایل:", font=FONT).pack(side="right")
         self.prof_var = tk.StringVar()
-        self.prof_box = ttk.Combobox(prow, 
-textvariable=self.prof_var, state="readonly", font=FONT, width=16)
+        self.prof_box = ttk.Combobox(prow, textvariable=self.prof_var, state="readonly", font=FONT, width=16)
         self.prof_box.pack(side="right", padx=6)
         for txt, fn in (("ذخیره", self.save_profile), ("بارگذاری", self.load_profile), ("حذف", self.delete_profile)):
             tk.Button(prow, text=txt, font=FONT, command=fn).pack(side="left", padx=2)
@@ -1445,22 +1423,19 @@ textvariable=self.prof_var, state="readonly", font=FONT, width=16)
         self.make_rows(box, SPECS_BASIC)
         st = self.cfg["settings"]
         for key, label in BOOLS:
-            self.sv[key] = tk.BooleanVar(
-value=bool(st.get(key)))
+            self.sv[key] = tk.BooleanVar(value=bool(st.get(key)))
             cmd = (lambda: self.root.attributes("-topmost", bool(self.sv["always_on_top"].get()))) if key == "always_on_top" else None
             tk.Checkbutton(box, text=label, variable=self.sv[key], font=FONT, command=cmd).pack(anchor="e", padx=8)
         hkf = tk.LabelFrame(tab, text=" کلیدهای میان‌بر (در همه‌ی برنامه‌ها کار می‌کنند) ", font=SMALL, labelanchor="ne")
         hkf.pack(fill="x", padx=10, pady=4)
         for key, label in HK_KEYS:
             hr = tk.Frame(hkf)
-            hr.pack(side="right", padx=8, 
-pady=3)
+            hr.pack(side="right", padx=8, pady=3)
             tk.Label(hr, text=label, font=SMALL).pack(side="right", padx=3)
             self.sv[key] = tk.StringVar(value=self.hk(key))
             ttk.Combobox(hr, textvariable=self.sv[key], values=HK_CHOICES, state="readonly", width=7, font=SMALL).pack(side="right")
         self.adv_on = tk.BooleanVar(value=False)
-        tk.Checkbutton(tab, text="گزینه‌های پیشرفته", variable=self.adv_on, font=FONT, command=self.toggle_adv).pack(anchor="e", 
-padx=14)
+        tk.Checkbutton(tab, text="گزینه‌های پیشرفته", variable=self.adv_on, font=FONT, command=self.toggle_adv).pack(anchor="e", padx=14)
         self.adv_box = tk.LabelFrame(tab, text=" پیشرفته ", font=FONT, labelanchor="ne")
         self.make_rows(self.adv_box, SPECS_ADV)
         tk.Button(self.adv_box, text="تشخیص مقیاس از روی صفحه‌ی فعلی (لیست محصولات)", font=SMALL, command=self.do_calibrate).pack(pady=4)
@@ -1469,8 +1444,7 @@ padx=14)
         if self.bot:
             return
         if "anchor" not in EMBEDDED:
-            messagebox.showinfo(APP_TITLE, 
-"تصویر راهنمای مقیاس (assets.py) پیدا نشد.")
+            messagebox.showinfo(APP_TITLE, "تصویر راهنمای مقیاس (assets.py) پیدا نشد.")
             return
         if not self.read_settings():
             return
@@ -1503,8 +1477,7 @@ padx=14)
 
     def toggle_adv(self):
         if self.adv_on.get():
-            self.adv_box.pack(fill="x", 
-padx=10, pady=4)
+            self.adv_box.pack(fill="x", padx=10, pady=4)
         else:
             self.adv_box.pack_forget()
 
@@ -1530,8 +1503,7 @@ padx=10, pady=4)
             raw = self.sv[key].get().strip()
             if kind == "hhmm":
                 if raw and not parse_hhmm(raw):
-                    messagebox.showerror(APP_TITLE, 
-"«%s» باید به شکل 20:00 باشد (یا خالی بماند)." % label, parent=self.top())
+                    messagebox.showerror(APP_TITLE, "«%s» باید به شکل 20:00 باشد (یا خالی بماند)." % label, parent=self.top())
                     return False
                 st[key] = raw
                 continue
@@ -1569,8 +1541,7 @@ padx=10, pady=4)
         self.log.see("end")
         self.log.configure(state="disabled")
 
-    def on_status(self, text, 
-kind="idle"):
+    def on_status(self, text, kind="idle"):
         colors = {"idle": ("#eeeeee", "#222"), "wait": ("#fff4cf", "#7a5600"), "run": ("#dff3e6", "#17803d"), "hit": ("#fdeaea", "#c0151a")}
         bg, fg = colors.get(kind, colors["idle"])
         self.status.configure(text=text, bg=bg, fg=fg)
@@ -1616,8 +1587,7 @@ kind="idle"):
         if st["speak"] and not st["test_mode"]:
             prewarm_speech()
         self.bot = Runner(self, self.cfg)
-        self.btn.configure(text="توقف  
-(%s)" % (self.hk("hk_stop") if self.hk("hk_stop") != "ندارد" else self.hk("hk_start")), bg="#c0151a")
+        self.btn.configure(text="توقف  (%s)" % (self.hk("hk_stop") if self.hk("hk_stop") != "ندارد" else self.hk("hk_start")), bg="#c0151a")
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
